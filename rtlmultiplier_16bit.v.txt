@@ -1,0 +1,464 @@
+cat > rtl/multiplier_16bit.v <<'EOF'
+`timescale 1ns / 1ps
+
+// ============================================================================
+// 1. 1-Bit Half Adder
+// ============================================================================
+module half_adder (
+    input  wire a,
+    input  wire b,
+    output wire sum,
+    output wire cout
+);
+    assign sum  = a ^ b;
+    assign cout = a & b;
+endmodule
+
+// ============================================================================
+// 2. 1-Bit Full Adder
+// ============================================================================
+module full_adder (
+    input  wire a,
+    input  wire b,
+    input  wire cin,
+    output wire sum,
+    output wire cout
+);
+    assign sum  = a ^ b ^ cin;
+    assign cout = (a & b) | (b & cin) | (a & cin);
+endmodule
+
+// ============================================================================
+// 3. 5x5 Baugh-Wooley Signed Multiplier (4-bit chunk engine)
+// ============================================================================
+module multiplier_4bit (
+    input  wire [4:0] a,
+    input  wire [4:0] b,
+    output wire [9:0] p
+);
+    wire pp0_0 =   a[0] & b[0];
+    wire pp1_0 =   a[1] & b[0];
+    wire pp2_0 =   a[2] & b[0];
+    wire pp3_0 =   a[3] & b[0];
+    wire pp4_0 = ~(a[4] & b[0]);
+
+    wire pp0_1 =   a[0] & b[1];
+    wire pp1_1 =   a[1] & b[1];
+    wire pp2_1 =   a[2] & b[1];
+    wire pp3_1 =   a[3] & b[1];
+    wire pp4_1 = ~(a[4] & b[1]);
+
+    wire pp0_2 =   a[0] & b[2];
+    wire pp1_2 =   a[1] & b[2];
+    wire pp2_2 =   a[2] & b[2];
+    wire pp3_2 =   a[3] & b[2];
+    wire pp4_2 = ~(a[4] & b[2]);
+
+    wire pp0_3 =   a[0] & b[3];
+    wire pp1_3 =   a[1] & b[3];
+    wire pp2_3 =   a[2] & b[3];
+    wire pp3_3 =   a[3] & b[3];
+    wire pp4_3 = ~(a[4] & b[3]);
+
+    wire pp0_4 = ~(a[0] & b[4]);
+    wire pp1_4 = ~(a[1] & b[4]);
+    wire pp2_4 = ~(a[2] & b[4]);
+    wire pp3_4 = ~(a[3] & b[4]);
+    wire pp4_4 =   a[4] & b[4];
+
+    assign p[0] = pp0_0;
+
+    wire s1_0, c1_0, s1_1, c1_1, s1_2, c1_2, s1_3, c1_3;
+    half_adder ha1_0 (.a(pp1_0), .b(pp0_1), .sum(s1_0), .cout(c1_0));
+    assign p[1] = s1_0;
+    half_adder ha1_1 (.a(pp2_0), .b(pp1_1), .sum(s1_1), .cout(c1_1));
+    half_adder ha1_2 (.a(pp3_0), .b(pp2_1), .sum(s1_2), .cout(c1_2));
+    half_adder ha1_3 (.a(pp4_0), .b(pp3_1), .sum(s1_3), .cout(c1_3));
+
+    wire s2_0, c2_0, s2_1, c2_1, s2_2, c2_2, s2_3, c2_3;
+    full_adder fa2_0 (.a(s1_1), .b(pp0_2), .cin(c1_0), .sum(s2_0), .cout(c2_0));
+    assign p[2] = s2_0;
+    full_adder fa2_1 (.a(s1_2), .b(pp1_2), .cin(c1_1), .sum(s2_1), .cout(c2_1));
+    full_adder fa2_2 (.a(s1_3), .b(pp2_2), .cin(c1_2), .sum(s2_2), .cout(c2_2));
+    full_adder fa2_3 (.a(pp4_1), .b(pp3_2), .cin(c1_3), .sum(s2_3), .cout(c2_3));
+
+    wire s3_0, c3_0, s3_1, c3_1, s3_2, c3_2, s3_3, c3_3;
+    full_adder fa3_0 (.a(s2_1), .b(pp0_3), .cin(c2_0), .sum(s3_0), .cout(c3_0));
+    assign p[3] = s3_0;
+    full_adder fa3_1 (.a(s2_2), .b(pp1_3), .cin(c2_1), .sum(s3_1), .cout(c3_1));
+    full_adder fa3_2 (.a(s2_3), .b(pp2_3), .cin(c2_2), .sum(s3_2), .cout(c3_2));
+    full_adder fa3_3 (.a(pp4_2), .b(pp3_3), .cin(c2_3), .sum(s3_3), .cout(c3_3));
+
+    wire s4_0, c4_0, s4_1, c4_1, s4_2, c4_2, s4_3, c4_3;
+    full_adder fa4_0 (.a(s3_1), .b(pp0_4), .cin(c3_0), .sum(s4_0), .cout(c4_0));
+    assign p[4] = s4_0;
+    full_adder fa4_1 (.a(s3_2), .b(pp1_4), .cin(c3_1), .sum(s4_1), .cout(c4_1));
+    full_adder fa4_2 (.a(s3_3), .b(pp2_4), .cin(c3_2), .sum(s4_2), .cout(c4_2));
+    full_adder fa4_3 (.a(pp4_3), .b(pp3_4), .cin(c3_3), .sum(s4_3), .cout(c4_3));
+
+    wire rc_c5, rc_c6, rc_c7, rc_c8;
+    full_adder fa_rc5 (.a(s4_1),  .b(c4_0), .cin(1'b1),  .sum(p[5]), .cout(rc_c5));
+    full_adder fa_rc6 (.a(s4_2),  .b(c4_1), .cin(rc_c5), .sum(p[6]), .cout(rc_c6));
+    full_adder fa_rc7 (.a(s4_3),  .b(c4_2), .cin(rc_c6), .sum(p[7]), .cout(rc_c7));
+    full_adder fa_rc8 (.a(pp4_4), .b(c4_3), .cin(rc_c7), .sum(p[8]), .cout(rc_c8));
+
+    assign p[9] = ~rc_c8;
+endmodule
+
+// ============================================================================
+// 4. 4-Bit Carry-Lookahead Adder
+// ============================================================================
+module cla_4bit (
+    input  wire [3:0] a,
+    input  wire [3:0] b,
+    input  wire       cin,
+    output wire [3:0] sum,
+    output wire       cout,
+    output wire       P_group,
+    output wire       G_group
+);
+    wire [3:0] p = a ^ b;
+    wire [3:0] g = a & b;
+
+    wire c1 = g[0] | (p[0] & cin);
+    wire c2 = g[1] | (p[1] & g[0]) | (p[1] & p[0] & cin);
+    wire c3 = g[2] | (p[2] & g[1]) | (p[2] & p[1] & g[0]) | (p[2] & p[1] & p[0] & cin);
+    wire c4 = g[3] | (p[3] & g[2]) | (p[3] & p[2] & g[1]) | (p[3] & p[2] & p[1] & g[0]) | (p[3] & p[2] & p[1] & p[0] & cin);
+
+    assign sum[0] = p[0] ^ cin;
+    assign sum[1] = p[1] ^ c1;
+    assign sum[2] = p[2] ^ c2;
+    assign sum[3] = p[3] ^ c3;
+
+    assign cout = c4;
+    assign P_group = p[3] & p[2] & p[1] & p[0];
+    assign G_group = g[3] | (p[3] & g[2]) | (p[3] & p[2] & g[1]) | (p[3] & p[2] & p[1] & g[0]);
+endmodule
+
+// ============================================================================
+// 5. 16-Bit Carry-Lookahead Adder
+// ============================================================================
+module cla_16bit (
+    input  wire [15:0] a,
+    input  wire [15:0] b,
+    input  wire        cin,
+    output wire [15:0] sum,
+    output wire        cout
+);
+    wire [3:0] P_grp, G_grp;
+    wire [4:0] c;
+    assign c[0] = cin;
+
+    assign c[1] = G_grp[0] | (P_grp[0] & c[0]);
+    assign c[2] = G_grp[1] | (P_grp[1] & G_grp[0]) | (P_grp[1] & P_grp[0] & c[0]);
+    assign c[3] = G_grp[2] | (P_grp[2] & G_grp[1]) | (P_grp[2] & P_grp[1] & G_grp[0]) | (P_grp[2] & P_grp[1] & P_grp[0] & c[0]);
+    assign c[4] = G_grp[3] | (P_grp[3] & G_grp[2]) | (P_grp[3] & P_grp[2] & G_grp[1]) | (P_grp[3] & P_grp[2] & P_grp[1] & G_grp[0]) | (P_grp[3] & P_grp[2] & P_grp[1] & P_grp[0] & c[0]);
+
+    cla_4bit u_cla0 (.a(a[3:0]),   .b(b[3:0]),   .cin(c[0]), .sum(sum[3:0]),   .cout(), .P_group(P_grp[0]), .G_group(G_grp[0]));
+    cla_4bit u_cla1 (.a(a[7:4]),   .b(b[7:4]),   .cin(c[1]), .sum(sum[7:4]),   .cout(), .P_group(P_grp[1]), .G_group(G_grp[1]));
+    cla_4bit u_cla2 (.a(a[11:8]),  .b(b[11:8]),  .cin(c[2]), .sum(sum[11:8]),  .cout(), .P_group(P_grp[2]), .G_group(G_grp[2]));
+    cla_4bit u_cla3 (.a(a[15:12]), .b(b[15:12]), .cin(c[3]), .sum(sum[15:12]), .cout(), .P_group(P_grp[3]), .G_group(G_grp[3]));
+
+    assign cout = c[4];
+endmodule
+
+// ============================================================================
+// 6. 32-Bit Carry-Lookahead Adder
+// ============================================================================
+module cla_32bit (
+    input  wire [31:0] a,
+    input  wire [31:0] b,
+    input  wire        cin,
+    output wire [31:0] sum,
+    output wire        cout
+);
+    wire c16;
+
+    cla_16bit u_cla_lower (
+        .a(a[15:0]),
+        .b(b[15:0]),
+        .cin(cin),
+        .sum(sum[15:0]),
+        .cout(c16)
+    );
+
+    cla_16bit u_cla_upper (
+        .a(a[31:16]),
+        .b(b[31:16]),
+        .cin(c16),
+        .sum(sum[31:16]),
+        .cout(cout)
+    );
+endmodule
+
+// ============================================================================
+// 7. 8x8 Multiplier Engine (int8_block with INT4 Internal Gating)
+// ============================================================================
+module int8_block (
+    input  wire [7:0]  a,
+    input  wire [7:0]  b,
+    input  wire [3:0]  Sx,
+    input  wire [3:0]  Sy,
+    input  wire        g2,
+    output wire [15:0] z
+);
+    wire [3:0] a_lo = a[3:0];
+    wire [3:0] a_hi = a[7:4];
+    wire [3:0] b_lo = b[3:0];
+    wire [3:0] b_hi = b[7:4];
+
+    // FIX 3: In INT4 mode (g2=0), gate b_lo for Mult 1 and a_lo for Mult 2
+    wire [3:0] b_lo_m1 = b_lo & {4{g2}};
+    wire [3:0] a_lo_m2 = a_lo & {4{g2}};
+
+    wire [4:0] a5_m0 = {Sx[0] & a_lo[3], a_lo};
+    wire [4:0] b5_m0 = {Sy[0] & b_lo[3], b_lo};
+
+    wire [4:0] a5_m1 = {Sx[1] & a_hi[3], a_hi};
+    wire [4:0] b5_m1 = {Sy[1] & b_lo_m1[3], b_lo_m1};
+
+    wire [4:0] a5_m2 = {Sx[2] & a_lo_m2[3], a_lo_m2};
+    wire [4:0] b5_m2 = {Sy[2] & b_hi[3], b_hi};
+
+    wire [4:0] a5_m3 = {Sx[3] & a_hi[3], a_hi};
+    wire [4:0] b5_m3 = {Sy[3] & b_hi[3], b_hi};
+
+    wire [9:0] p0_raw, p1_raw, p2_raw, p3_raw;
+
+    multiplier_4bit u_mult0 (.a(a5_m0), .b(b5_m0), .p(p0_raw));
+    multiplier_4bit u_mult1 (.a(a5_m1), .b(b5_m1), .p(p1_raw));
+    multiplier_4bit u_mult2 (.a(a5_m2), .b(b5_m2), .p(p2_raw));
+    multiplier_4bit u_mult3 (.a(a5_m3), .b(b5_m3), .p(p3_raw));
+
+    wire [15:0] P0, P1, P2, P3;
+
+    assign P0[7:0]   = p0_raw[7:0];
+    assign P0[8]     = g2 & p0_raw[8];
+    assign P0[9]     = g2 & p0_raw[9];
+    assign P0[15:10] = {6{g2 & p0_raw[9]}};
+
+    assign P1[3:0]   = 4'b0000;
+    assign P1[13:4]  = p1_raw[9:0];
+    assign P1[15:14] = {2{p1_raw[9]}};
+
+    assign P2[3:0]   = 4'b0000;
+    assign P2[13:4]  = p2_raw[9:0];
+    assign P2[15:14] = {2{p2_raw[9]}};
+
+    assign P3[7:0]   = 8'b0000_0000;
+    assign P3[15:8]  = p3_raw[7:0];
+
+    wire [15:0] s1, c1;
+    genvar i;
+    generate
+        for (i = 0; i < 16; i = i + 1) begin : gen_csa_stage1
+            full_adder fa_st1 (
+                .a(P0[i]),
+                .b(P1[i]),
+                .cin(P2[i]),
+                .sum(s1[i]),
+                .cout(c1[i])
+            );
+        end
+    endgenerate
+
+    wire [15:0] s2, c2;
+    full_adder fa_st2_0 (
+        .a(s1[0]),
+        .b(1'b0),
+        .cin(P3[0]),
+        .sum(s2[0]),
+        .cout(c2[0])
+    );
+
+    generate
+        for (i = 1; i < 16; i = i + 1) begin : gen_csa_stage2
+            full_adder fa_st2 (
+                .a(s1[i]),
+                .b(c1[i-1]),
+                .cin(P3[i]),
+                .sum(s2[i]),
+                .cout(c2[i])
+            );
+        end
+    endgenerate
+
+    wire [15:0] op_a = s2;
+    wire [15:0] op_b = {c2[14:0], 1'b0};
+
+    cla_16bit u_final_cla (
+        .a(op_a),
+        .b(op_b),
+        .cin(1'b0),
+        .sum(z),
+        .cout()
+    );
+endmodule
+
+// ============================================================================
+// 8. 16x16 Multiplier PE (Top-Level)
+// ============================================================================
+module multiplier_16bit (
+    input  wire        clk,        // System Clock (300 MHz)
+    input  wire        rst_n,      // Active-low asynchronous reset
+    input  wire [1:0]  mode,       // 2'b00: INT4, 2'b01: INT8, 2'b10: INT16
+    input  wire [15:0] a,          // 16-bit multiplicand
+    input  wire [15:0] b,          // 16-bit multiplier
+    output reg  [31:0] product     // 32-bit registered output
+);
+
+    wire en_int4  = (mode == 2'b00);
+    wire en_int8  = (mode == 2'b01);
+    wire en_int16 = (mode == 2'b10);
+
+    wire G1 = en_int4 | en_int8 | en_int16;
+    wire G2 = en_int8 | en_int16;
+    wire G3 = en_int16;
+    wire g2 = G2;
+
+    wire [15:0] a_iso, b_iso;
+    assign a_iso[3:0]   = a[3:0]   & {4{G1}};
+    assign a_iso[7:4]   = a[7:4]   & {4{G2}};
+    assign a_iso[11:8]  = a[11:8]  & {4{G3}};
+    assign a_iso[15:12] = a[15:12] & {4{G3}};
+
+    assign b_iso[3:0]   = b[3:0]   & {4{G1}};
+    assign b_iso[7:4]   = b[7:4]   & {4{G2}};
+    assign b_iso[11:8]  = b[11:8]  & {4{G3}};
+    assign b_iso[15:12] = b[15:12] & {4{G3}};
+
+    wire [3:0] sx = en_int4  ? 4'b0001 :
+                    en_int8  ? 4'b0010 :
+                    en_int16 ? 4'b1000 :
+                               4'b0000;
+
+    wire [3:0] sy = en_int4  ? 4'b0001 :
+                    en_int8  ? 4'b0010 :
+                    en_int16 ? 4'b1000 :
+                               4'b0000;
+
+    wire [3:0] Sx_b0 = {sx[1], sx[0], sx[1], sx[0]};
+    wire [3:0] Sy_b0 = {sy[1], sy[1], sy[0], sy[0]};
+
+    wire [3:0] Sx_b1 = {sx[3], sx[2], sx[3], sx[2]};
+    wire [3:0] Sy_b1 = {sy[1], sy[1], sy[0], sy[0]};
+
+    wire [3:0] Sx_b2 = {sx[1], sx[0], sx[1], sx[0]};
+    wire [3:0] Sy_b2 = {sy[3], sy[3], sy[2], sy[2]};
+
+    wire [3:0] Sx_b3 = {sx[3], sx[2], sx[3], sx[2]};
+    wire [3:0] Sy_b3 = {sy[3], sy[3], sy[2], sy[2]};
+
+    wire [15:0] z0, z1, z2, z3;
+
+    // Block 0: A[7:0] x B[7:0]
+    int8_block u_block0 (
+        .a(a_iso[7:0]),
+        .b(b_iso[7:0]),
+        .Sx(Sx_b0),
+        .Sy(Sy_b0),
+        .g2(g2),
+        .z(z0)
+    );
+
+    // FIX 2: Gate input b with G3 so it doesn't toggle during INT8
+    int8_block u_block1 (
+        .a(a_iso[15:8]),
+        .b(b_iso[7:0] & {8{G3}}),
+        .Sx(Sx_b1),
+        .Sy(Sy_b1),
+        .g2(1'b1),
+        .z(z1)
+    );
+
+    // FIX 2: Gate input a with G3 so it doesn't toggle during INT8
+    int8_block u_block2 (
+        .a(a_iso[7:0] & {8{G3}}),
+        .b(b_iso[15:8]),
+        .Sx(Sx_b2),
+        .Sy(Sy_b2),
+        .g2(1'b1),
+        .z(z2)
+    );
+
+    // Block 3: A[15:8] x B[15:8]
+    int8_block u_block3 (
+        .a(a_iso[15:8]),
+        .b(b_iso[15:8]),
+        .Sx(Sx_b3),
+        .Sy(Sy_b3),
+        .g2(1'b1),
+        .z(z3)
+    );
+
+    // ------------------------------------------------------------------------
+    // Step 5: 32-Bit Vector Alignment (Shifts: 0, 8, 8, 16)
+    // FIX 1: V0 is gated with G3 so 32-bit CSA & CLA are quiet in INT4/INT8!
+    // ------------------------------------------------------------------------
+    wire [31:0] V0 = {16'b0, z0 & {16{G3}}};
+    wire [31:0] V1 = {{8{z1[15]}}, z1, 8'b0};
+    wire [31:0] V2 = {{8{z2[15]}}, z2, 8'b0};
+    wire [31:0] V3 = {z3, 16'b0};
+
+    wire [31:0] s1, c1;
+    genvar k;
+    generate
+        for (k = 0; k < 32; k = k + 1) begin : gen_csa32_st1
+            full_adder fa32_st1 (
+                .a(V0[k]),
+                .b(V1[k]),
+                .cin(V2[k]),
+                .sum(s1[k]),
+                .cout(c1[k])
+            );
+        end
+    endgenerate
+
+    wire [31:0] s2, c2;
+    full_adder fa32_st2_0 (
+        .a(s1[0]),
+        .b(1'b0),
+        .cin(V3[0]),
+        .sum(s2[0]),
+        .cout(c2[0])
+    );
+
+    generate
+        for (k = 1; k < 32; k = k + 1) begin : gen_csa32_st2
+            full_adder fa32_st2 (
+                .a(s1[k]),
+                .b(c1[k-1]),
+                .cin(V3[k]),
+                .sum(s2[k]),
+                .cout(c2[k])
+            );
+        end
+    endgenerate
+
+    wire [31:0] sum_int16_32b;
+    wire [31:0] op_a = s2;
+    wire [31:0] op_b = {c2[30:0], 1'b0};
+
+    cla_32bit u_cla32 (
+        .a(op_a),
+        .b(op_b),
+        .cin(1'b0),
+        .sum(sum_int16_32b),
+        .cout()
+    );
+
+    // Direct output mux: INT4 and INT8 take z0 directly!
+    wire [31:0] product_comb = en_int4  ? {{24{z0[7]}},  z0[7:0]} :
+                               en_int8  ? {{16{z0[15]}}, z0[15:0]} :
+                               sum_int16_32b;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            product <= 32'd0;
+        end else begin
+            product <= product_comb;
+        end
+    end
+
+endmodule
+EOF
