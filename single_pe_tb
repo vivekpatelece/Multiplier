@@ -1,0 +1,667 @@
+// ============================================================================
+// File: pe_tb_final.v
+// Description: Exhaustive Self-Checking Testbench for Processing Element (PE)
+// Tests: 26 tests covering Reset, Idle Gating, Forwarding, INT4/INT8/INT16
+//        corner cases, mode transitions, and Monte Carlo stress.
+// ============================================================================
+//
+// ----------------------------------------------------------------------------
+// OVERVIEW (read this first)
+// ----------------------------------------------------------------------------
+// WHAT IS A TESTBENCH?
+//   A testbench is Verilog code that is only used in simulation. It has no
+//   ports of its own. It creates a clock, drives the inputs of the design
+//   under test (DUT, here the `pe` module), reads its outputs and compares
+//   them with the answers we expect. It is "self-checking" because it prints
+//   PASS / FAIL by itself, so nobody has to inspect waveforms by hand.
+//
+// HOW THIS TESTBENCH WORKS:
+//   1. Generate a clock and instantiate the PE.
+//   2. For each test, fill two arrays (test_a, test_b) with 16 operand pairs.
+//   3. Stream the 16 pairs into the PE, one per clock. The PE multiplies each
+//      pair and adds the result to its accumulator (a 16-element dot product).
+//   4. Compute the same dot product in plain Verilog (the "golden" answer):
+//
+//        golden answer = sum over k = 0..15 of ( test_a[k] * test_b[k] )
+//
+//   5. Compare the PE's acc_out with the golden answer.
+//
+// TEST PLAN:
+//   Tests  1 - 3   : reset, idle input rejection, a_out/b_out forwarding
+//   Group A (4-10) : INT4  precision, mode = 2'b00
+//   Group B (11-16): INT8  precision, mode = 2'b01
+//   Group C (17-20): INT16 precision, mode = 2'b10
+//   Group D (21-23): switching between precisions (no old data may leak)
+//   Group E (24-26): random (Monte Carlo) dot products in each precision
+//
+// HOW THE TESTS ARE COUNTED:
+//   Tests 24, 25 and 26 each run 10 random dot products and every run is
+//   counted as one check. So the scorecard shows 53 checks for 26 test
+//   suites: 23 directed checks (tests 1 to 23) + 30 random checks.
+//
+// POWER-GATING CHECK:
+//   In INT4 only accumulator bits [11:0] may be used, and in INT8 only bits
+//   [19:0]. The checks therefore also require the upper bits to be exactly
+//   zero, which proves the unused slices stayed frozen.
+//
+// SIMULATION TIME:
+//   The whole run takes about 8.3 us of simulated time. In Vivado the default
+//   run length is only 1000 ns, so type `run all` in the Tcl console (or set
+//   the xsim runtime to -all) to see the full log and the scorecard.
+// ============================================================================
+`timescale 1ns / 1ps
+
+module pe_tb;
+
+    // ------------------------------------------------------------------------
+    // Clock & DUT Signals
+    // ------------------------------------------------------------------------
+    // `reg`  = signals the testbench DRIVES into the PE (inputs of the DUT)
+    // `wire` = signals the PE DRIVES back to us (outputs of the DUT)
+    reg         clk;            // clock for the PE
+    reg         rst_n;          // active-low reset (0 = reset, 1 = run)
+    reg         in_valid;       // 1 = a_in / b_in carry real data this cycle
+    reg         clr_acc;        // 1 = start a new accumulation with this input
+    reg  [1:0]  mode;           // precision select: 00 INT4, 01 INT8, 10 INT16
+    reg  [15:0] a_in;           // operand A going into the PE
+    reg  [15:0] b_in;           // operand B going into the PE
+
+    wire [15:0] a_out;          // A forwarded by the PE (for the next PE)
+    wire [15:0] b_out;          // B forwarded by the PE (for the next PE)
+    wire [35:0] acc_out;        // 36-bit accumulated result
+    wire        acc_valid;      // 1 when acc_out holds a valid result
+
+    // Scoreboard counters: how many checks ran, passed and failed.
+    // They are printed in the final scorecard at the end of the simulation.
+    integer total_tests  = 0;
+    integer passed_tests = 0;
+    integer failed_tests = 0;
+
+    // Test vectors: two arrays of 16 signed 16-bit numbers. Each test fills
+    // them with its operands; stream_16_vector then feeds element 0..15 into
+    // the PE. Even small INT4/INT8 values are stored in 16-bit words.
+    reg signed [15:0] test_a [0:15];
+    reg signed [15:0] test_b [0:15];
+
+    // ------------------------------------------------------------------------
+    // Device Under Test (DUT) Instantiation
+    // ------------------------------------------------------------------------
+    // Create one PE and connect every port to the signals declared above.
+    // Syntax:  .port_name (signal_in_this_testbench)
+    // PIPELINED(0) = no extra pipeline register: the product goes straight
+    // from the multiplier into the accumulator adder in one clock cycle.
+    pe #(
+        .PIPELINED(0)
+    ) dut (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .in_valid (in_valid),
+        .clr_acc  (clr_acc),
+        .mode     (mode),
+        .a_in     (a_in),
+        .b_in     (b_in),
+        .a_out    (a_out),
+        .b_out    (b_out),
+        .acc_out  (acc_out),
+        .acc_valid(acc_valid)
+    );
+
+    // ------------------------------------------------------------------------
+    // Simulation Clock (10 ns period = 100 MHz)
+    // ------------------------------------------------------------------------
+    // The clock starts at 0 and flips every half period (5 ns) forever.
+    // Rising edges (posedge) happen at 5, 15, 25 ns ... and falling edges
+    // (negedge) at 10, 20, 30 ns ...
+    // The testbench changes inputs on the FALLING edge and the PE samples them
+    // on the RISING edge, so inputs are always stable when the PE looks at
+    // them (no race between the testbench and the design).
+    localparam CLK_PERIOD = 10;
+    initial begin
+        clk = 1'b0;
+        forever #(CLK_PERIOD / 2) clk = ~clk;
+    end
+
+    // ------------------------------------------------------------------------
+    // Waveform VCD Dump
+    // ------------------------------------------------------------------------
+    // Record every signal in this testbench (and below it) into a VCD file
+    // that can be opened in a waveform viewer such as GTKWave. A VCD from a
+    // single-mode run can also be used for power analysis.
+    initial begin
+        $dumpfile("pe_tb.vcd");
+        $dumpvars(0, pe_tb);
+    end
+
+    // ------------------------------------------------------------------------
+    // Helper Tasks
+    // ------------------------------------------------------------------------
+    // A task is a reusable block of testbench code, like a function that can
+    // wait for clock edges. These tasks avoid repeating the same code in
+    // every test.
+
+    // reset_dut: puts every input in a known state and pulses reset.
+    // Sequence: assert reset (low) for about two clocks, then release it.
+    task reset_dut;
+        begin
+            @(negedge clk);             // wait for a falling clock edge
+            rst_n    = 1'b0;            // assert reset (active low)
+            in_valid = 1'b0;            // no data
+            clr_acc  = 1'b0;
+            mode     = 2'b00;           // start in INT4
+            a_in     = 16'd0;
+            b_in     = 16'd0;
+            #(CLK_PERIOD * 2);          // hold reset for 2 clock periods
+            @(negedge clk);
+            rst_n    = 1'b1;            // release reset
+            #(CLK_PERIOD);              // wait one more clock before testing
+        end
+    endtask
+
+    // stream_16_vector: sends the 16 operand pairs stored in test_a/test_b
+    // into the PE, one pair per clock cycle, using precision `mode_sel`.
+    //   - element 0 also raises clr_acc, which starts a fresh accumulation
+    //     (so the old result from the previous test is thrown away)
+    //   - when finished, the inputs are returned to the idle state
+    task stream_16_vector;
+        input [1:0] mode_sel;           // 00 = INT4, 01 = INT8, 10 = INT16
+        integer idx;                    // loop counter for the 16 elements
+        begin
+            @(negedge clk);
+            mode = mode_sel;
+            for (idx = 0; idx < 16; idx = idx + 1) begin
+                in_valid = 1'b1;
+                clr_acc  = (idx == 0) ? 1'b1 : 1'b0;   // clear only on element 0
+                a_in     = test_a[idx];
+                b_in     = test_b[idx];
+                @(negedge clk);         // hold this pair for one full clock
+            end
+            // All 16 pairs sent: return the inputs to the idle state.
+            in_valid = 1'b0;
+            clr_acc  = 1'b0;
+            a_in     = 16'd0;
+            b_in     = 16'd0;
+        end
+    endtask
+
+    // check_int4_result: compares the accumulator with the expected INT4 sum.
+    // In INT4 mode only the low 12 bits of the accumulator are used, so:
+    //   PASS = acc_out[11:0] equals the expected value (as a signed number)
+    //          AND acc_out[35:12] is all zeros (upper slices stayed frozen)
+    // NOTE: test_name is a 128-bit (16 character) argument, so a longer name
+    //       is cut and only its last 16 characters appear in the log.
+    task check_int4_result;
+        input [31:0]  test_id;          // test number, printed in the log
+        input [127:0] test_name;        // label for the log (16 chars max)
+        input integer expected_sum;     // golden answer computed in software
+        reg signed [11:0] exp_12b;      // expected value cut to 12 bits
+        reg signed [11:0] got_12b;      // value actually read from the PE
+        begin
+            total_tests = total_tests + 1;
+            exp_12b = expected_sum[11:0];
+            // The last element is still being accumulated when
+            // stream_16_vector returns, so wait for the next rising edge.
+            @(posedge clk);
+            #1;                         // look 1 ns after the edge (outputs settled)
+            got_12b = acc_out[11:0];
+            // `===` also treats X/Z values as mismatches, which is what we
+            // want in verification (plain `==` could hide an unknown value).
+            if (got_12b === exp_12b && acc_out[35:12] === 24'b0) begin
+                $display("[PASS] Test %02d | %0s: Acc = %0d (12'h%03h) | Upper[35:12] = 24'b0 (Power Gated)",
+                         test_id, test_name, got_12b, acc_out[11:0]);
+                passed_tests = passed_tests + 1;
+            end else begin
+                $display("[FAIL] Test %02d | %0s: GOT Acc = %0d (36'h%09h), EXP = %0d (12'h%03h) | Upper[35:12] = 24'h%06h",
+                         test_id, test_name, got_12b, acc_out, expected_sum, exp_12b, acc_out[35:12]);
+                failed_tests = failed_tests + 1;
+            end
+        end
+    endtask
+
+    // check_int8_result: same idea for INT8, where the accumulator uses the
+    // low 20 bits and bits [35:20] must stay zero.
+    task check_int8_result;
+        input [31:0]  test_id;          // test number, printed in the log
+        input [127:0] test_name;        // label for the log (16 chars max)
+        input integer expected_sum;     // golden answer computed in software
+        reg signed [19:0] exp_20b;      // expected value cut to 20 bits
+        reg signed [19:0] got_20b;      // value actually read from the PE
+        begin
+            total_tests = total_tests + 1;
+            exp_20b = expected_sum[19:0];
+            @(posedge clk);             // let the last element finish accumulating
+            #1;
+            got_20b = acc_out[19:0];
+            if (got_20b === exp_20b && acc_out[35:20] === 16'b0) begin
+                $display("[PASS] Test %02d | %0s: Acc = %0d (20'h%05h) | Upper[35:20] = 16'b0 (Power Gated)",
+                         test_id, test_name, got_20b, acc_out[19:0]);
+                passed_tests = passed_tests + 1;
+            end else begin
+                $display("[FAIL] Test %02d | %0s: GOT Acc = %0d (36'h%09h), EXP = %0d (20'h%05h) | Upper[35:20] = 16'h%04h",
+                         test_id, test_name, got_20b, acc_out, expected_sum, exp_20b, acc_out[35:20]);
+                failed_tests = failed_tests + 1;
+            end
+        end
+    endtask
+
+    // check_int16_result: INT16 uses all 36 accumulator bits, so the whole
+    // acc_out must equal the expected sum (cut to 36 bits). The expected
+    // value is passed as a 64-bit signed number because 16 products of
+    // 16x16 bits can be larger than a 32-bit integer.
+    task check_int16_result;
+        input [31:0]  test_id;          // test number, printed in the log
+        input [127:0] test_name;        // label for the log (16 chars max)
+        input reg signed [63:0] expected_sum;   // golden answer (64-bit signed)
+        reg signed [35:0] exp_36b;      // expected value cut to 36 bits
+        begin
+            total_tests = total_tests + 1;
+            exp_36b = expected_sum[35:0];
+            @(posedge clk);             // let the last element finish accumulating
+            #1;
+            if (acc_out === exp_36b) begin
+                $display("[PASS] Test %02d | %0s: Acc = %0d (36'h%09h)",
+                         test_id, test_name, $signed(acc_out), acc_out);
+                passed_tests = passed_tests + 1;
+            end else begin
+                $display("[FAIL] Test %02d | %0s: GOT Acc = %0d (36'h%09h), EXP = %0d (36'h%09h)",
+                         test_id, test_name, $signed(acc_out), acc_out, expected_sum, exp_36b);
+                failed_tests = failed_tests + 1;
+            end
+        end
+    endtask
+
+    // Loop counters and golden-model variables used by the tests below.
+    integer k, iter;                    // k = element index, iter = random-run index
+    integer exp_acc_sw;                 // golden sum for INT4 / INT8 (32-bit is enough)
+    reg signed [63:0] exp_acc_sw_64;    // golden sum for INT16 (needs more bits)
+    reg [31:0] rnd_tmp; // temp for bit-slicing $random
+
+    // ------------------------------------------------------------------------
+    // Main Verification Procedure
+    // ------------------------------------------------------------------------
+    // This single `initial` block runs once at time 0 and executes all the
+    // tests in order, then ends the simulation with $finish.
+    initial begin
+        $display("==================================================================================");
+        $display("       STARTING EXHAUSTIVE VERIFICATION FOR PROCESSING ELEMENT (PE)               ");
+        $display("==================================================================================");
+
+        // TEST 1: Reset
+        // After reset every output must be 0 and acc_valid must be 0.
+        reset_dut;
+        total_tests = total_tests + 1;
+        if (acc_out === 36'd0 && a_out === 16'd0 && b_out === 16'd0 && acc_valid === 1'b0) begin
+            $display("[PASS] Test 01 | Reset: All registers & outputs cleared cleanly to 0.");
+            passed_tests = passed_tests + 1;
+        end else begin
+            $display("[FAIL] Test 01 | Reset: Outputs did not clear to 0!");
+            failed_tests = failed_tests + 1;
+        end
+
+        // TEST 2: Idle Gating
+        // Drive "noise" on a_in / b_in but keep in_valid = 0. The PE must
+        // ignore it: its registers should stay 0 for 4 clock cycles.
+        @(negedge clk);
+        in_valid = 1'b0;
+        clr_acc  = 1'b0;
+        mode     = 2'b00;
+        a_in     = 16'hAAAA;
+        b_in     = 16'h5555;
+        #(CLK_PERIOD * 4);
+        total_tests = total_tests + 1;
+        if (a_out === 16'd0 && b_out === 16'd0 && acc_out === 36'd0) begin
+            $display("[PASS] Test 02 | Idle Gating: Input noise rejected; registers stayed 0 when in_valid=0.");
+            passed_tests = passed_tests + 1;
+        end else begin
+            $display("[FAIL] Test 02 | Idle Gating: Registers toggled despite in_valid=0!");
+            failed_tests = failed_tests + 1;
+        end
+
+        // TEST 3: Systolic Forwarding
+        // With in_valid = 1, the values on a_in / b_in should appear on
+        // a_out / b_out one clock later (this is how data moves between PEs).
+        // NOTE: mode is INT4 (2'b00) here. In INT4, input register slices [15:8] and [7:4]
+        // are forced to 0. So a_out = {8'b0, 4'b0, a_in[3:0]} = 16'h0004,
+        // b_out = 16'h0008. Test checks only [3:0] slice which is forwarded correctly.
+        // (The note above describes what would happen in INT4. The code below
+        // switches to INT16 first, so all 16 bits are forwarded and checked.)
+        @(negedge clk);
+        mode     = 2'b10; // Use INT16 so full 16-bit value is forwarded
+        in_valid = 1'b1;
+        a_in     = 16'h1234;
+        b_in     = 16'h5678;
+        @(posedge clk);
+        #1;
+        total_tests = total_tests + 1;
+        if (a_out === 16'h1234 && b_out === 16'h5678) begin
+            $display("[PASS] Test 03 | Systolic Forwarding: a_out & b_out correctly forward inputs on 1-cycle delay.");
+            passed_tests = passed_tests + 1;
+        end else begin
+            $display("[FAIL] Test 03 | Systolic Forwarding: Got a_out=%0h b_out=%0h, expected 1234/5678!", a_out, b_out);
+            failed_tests = failed_tests + 1;
+        end
+        @(negedge clk);
+        in_valid = 1'b0;
+
+        // --------------------------------------------------------------------
+        // GROUP A: INT4 (mode = 2'b00)
+        // --------------------------------------------------------------------
+        // INT4 operands are signed 4-bit numbers, range -8 .. +7.
+        $display("\n----------------------------------------------------------------------------------");
+        $display("  TEST GROUP A: INT4 Precision Mode (mode = 2'b00)");
+        $display("----------------------------------------------------------------------------------");
+
+        // TEST 4: INT4 Mixed
+        // Hand-picked mix of positive and negative operands. The expected
+        // answer is computed by the loop right after the table.
+        test_a[0] = -3;  test_b[0] =  4;
+        test_a[1] =  5;  test_b[1] = -2;
+        test_a[2] = -8;  test_b[2] = -7;
+        test_a[3] =  7;  test_b[3] =  6;
+        test_a[4] = -1;  test_b[4] =  3;
+        test_a[5] =  2;  test_b[5] = -5;
+        test_a[6] = -4;  test_b[6] = -4;
+        test_a[7] =  6;  test_b[7] =  1;
+        test_a[8] = -6;  test_b[8] =  7;
+        test_a[9] =  3;  test_b[9] = -8;
+        test_a[10]= -7;  test_b[10]= -1;
+        test_a[11]=  4;  test_b[11]=  2;
+        test_a[12]= -2;  test_b[12]=  5;
+        test_a[13]=  1;  test_b[13]= -3;
+        test_a[14]= -5;  test_b[14]= -6;
+        test_a[15]=  0;  test_b[15]=  7;
+        // Golden model: add up all 16 products in ordinary Verilog.
+        exp_acc_sw = 0;
+        for (k = 0; k < 16; k = k + 1) exp_acc_sw = exp_acc_sw + (test_a[k] * test_b[k]);
+        stream_16_vector(2'b00);
+        check_int4_result(4, "INT4 Mixed Random Vector", exp_acc_sw);
+
+        // TEST 5: INT4 Max Pos (+1024)
+        // (-8) * (-8) = +64 is the largest INT4 product; 16 x 64 = 1024.
+        for (k = 0; k < 16; k = k + 1) begin test_a[k] = -8; test_b[k] = -8; end
+        stream_16_vector(2'b00);
+        check_int4_result(5, "INT4 Max Pos Corner (+1024)", 1024);
+
+        // TEST 6: INT4 Max Neg (-896)
+        // (-8) * 7 = -56 is the most negative INT4 product; 16 x -56 = -896.
+        for (k = 0; k < 16; k = k + 1) begin test_a[k] = -8; test_b[k] = 7; end
+        stream_16_vector(2'b00);
+        check_int4_result(6, "INT4 Max Neg Corner (-896)", -896);
+
+        // TEST 7: INT4 Zero Operands
+        // A is always 0, so every product must be 0 whatever B is.
+        for (k = 0; k < 16; k = k + 1) begin test_a[k] = 0; test_b[k] = (k % 2 == 0) ? 7 : -8; end
+        stream_16_vector(2'b00);
+        check_int4_result(7, "INT4 Zero Operands (0*X=0)", 0);
+
+        // TEST 8: INT4 Pos*Pos (+784)
+        // 7 * 7 = 49; 16 x 49 = 784.
+        for (k = 0; k < 16; k = k + 1) begin test_a[k] = 7; test_b[k] = 7; end
+        stream_16_vector(2'b00);
+        check_int4_result(8, "INT4 Pos*Pos Corner (+784)", 784);
+
+        // TEST 9: INT4 Alternating Signs
+        // Operands swing between the two extreme values every cycle, which
+        // flips many bits at once (a stress test for the datapath).
+        exp_acc_sw = 0;
+        for (k = 0; k < 16; k = k + 1) begin
+            test_a[k] = (k % 2 == 0) ?  7 : -8;
+            test_b[k] = (k % 2 == 0) ? -8 :  7;
+            exp_acc_sw = exp_acc_sw + (test_a[k] * test_b[k]);
+        end
+        stream_16_vector(2'b00);
+        check_int4_result(9, "INT4 Alternating Signs Toggle", exp_acc_sw);
+
+        // TEST 10: INT4 Power Check
+        // Looks at the accumulator left over from the last INT4 run: bits
+        // [35:12] must still be zero, proving the upper slices never moved.
+        total_tests = total_tests + 1;
+        if (acc_out[35:12] === 24'b0) begin
+            $display("[PASS] Test 10 | INT4 Power Verification: Upper 24 bits[35:12] strictly ZERO across all INT4 runs.");
+            passed_tests = passed_tests + 1;
+        end else begin
+            $display("[FAIL] Test 10 | INT4 Power Violation: Upper bits leaked! Upper[35:12] = 24'h%06h", acc_out[35:12]);
+            failed_tests = failed_tests + 1;
+        end
+
+        // --------------------------------------------------------------------
+        // GROUP B: INT8 (mode = 2'b01)
+        // --------------------------------------------------------------------
+        // INT8 operands are signed 8-bit numbers, range -128 .. +127.
+        $display("\n----------------------------------------------------------------------------------");
+        $display("  TEST GROUP B: INT8 Precision Mode (mode = 2'b01)");
+        $display("----------------------------------------------------------------------------------");
+
+        // TEST 11: INT8 Mixed
+        // Same idea as test 4 but with bigger numbers.
+        test_a[0] = -100; test_b[0] =  45; test_a[1] =   64; test_b[1] = -32;
+        test_a[2] = -128; test_b[2] = -80; test_a[3] =  127; test_b[3] =  90;
+        test_a[4] =  -15; test_b[4] =  75; test_a[5] =   50; test_b[5] = -60;
+        test_a[6] =  -40; test_b[6] = -40; test_a[7] =   95; test_b[7] =  10;
+        test_a[8] =  -85; test_b[8] = 110; test_a[9] =   30; test_b[9] =-120;
+        test_a[10]=  -70; test_b[10]= -15; test_a[11]=   44; test_b[11]=  22;
+        test_a[12]=  -25; test_b[12]=  55; test_a[13]=   18; test_b[13]= -38;
+        test_a[14]= -112; test_b[14]= -65; test_a[15]=    0; test_b[15]= 127;
+        exp_acc_sw = 0;
+        for (k = 0; k < 16; k = k + 1) exp_acc_sw = exp_acc_sw + (test_a[k] * test_b[k]);
+        stream_16_vector(2'b01);
+        check_int8_result(11, "INT8 Mixed Random Vector", exp_acc_sw);
+
+        // TEST 12: INT8 Max Pos (+262144)
+        // (-128) * (-128) = 16384; 16 x 16384 = 262144.
+        for (k = 0; k < 16; k = k + 1) begin test_a[k] = -128; test_b[k] = -128; end
+        stream_16_vector(2'b01);
+        check_int8_result(12, "INT8 Max Pos Corner (+262144)", 262144);
+
+        // TEST 13: INT8 Max Neg (-260096)
+        // (-128) * 127 = -16256; 16 x -16256 = -260096.
+        for (k = 0; k < 16; k = k + 1) begin test_a[k] = -128; test_b[k] = 127; end
+        stream_16_vector(2'b01);
+        check_int8_result(13, "INT8 Max Neg Corner (-260096)", -260096);
+
+        // TEST 14: INT8 Pos*Pos (+258064)
+        // 127 * 127 = 16129; 16 x 16129 = 258064.
+        for (k = 0; k < 16; k = k + 1) begin test_a[k] = 127; test_b[k] = 127; end
+        stream_16_vector(2'b01);
+        check_int8_result(14, "INT8 Pos*Pos Corner (+258064)", 258064);
+
+        // TEST 15: INT8 Dynamic Swings
+        // Operands alternate between the two extremes every cycle.
+        exp_acc_sw = 0;
+        for (k = 0; k < 16; k = k + 1) begin
+            test_a[k] = (k % 2 == 0) ?  127 : -128;
+            test_b[k] = (k % 2 == 0) ? -128 :  127;
+            exp_acc_sw = exp_acc_sw + (test_a[k] * test_b[k]);
+        end
+        stream_16_vector(2'b01);
+        check_int8_result(15, "INT8 Large Dynamic Swings", exp_acc_sw);
+
+        // TEST 16: INT8 Power Check
+        // In INT8 the accumulator uses bits [19:0]; bits [35:20] must be 0.
+        total_tests = total_tests + 1;
+        if (acc_out[35:20] === 16'b0) begin
+            $display("[PASS] Test 16 | INT8 Power Verification: Upper 16 bits[35:20] strictly ZERO across all INT8 runs.");
+            passed_tests = passed_tests + 1;
+        end else begin
+            $display("[FAIL] Test 16 | INT8 Power Violation: Upper bits leaked! Upper[35:20] = 16'h%04h", acc_out[35:20]);
+            failed_tests = failed_tests + 1;
+        end
+
+        // --------------------------------------------------------------------
+        // GROUP C: INT16 (mode = 2'b10)
+        // --------------------------------------------------------------------
+        // INT16 operands are signed 16-bit numbers, range -32768 .. +32767.
+        $display("\n----------------------------------------------------------------------------------");
+        $display("  TEST GROUP C: INT16 Precision Mode (mode = 2'b10)");
+        $display("----------------------------------------------------------------------------------");
+
+        // TEST 17: INT16 Mixed
+        test_a[0] = -12000; test_b[0] =   4500; test_a[1] =  16384; test_b[1] =  -8192;
+        test_a[2] = -32768; test_b[2] = -15000; test_a[3] =  32767; test_b[3] =  20000;
+        test_a[4] =  -5000; test_b[4] =   7500; test_a[5] =   8000; test_b[5] = -12000;
+        test_a[6] = -14000; test_b[6] = -14000; test_a[7] =  25000; test_b[7] =   3000;
+        test_a[8] = -22000; test_b[8] =  18000; test_a[9] =  11000; test_b[9] = -28000;
+        test_a[10]= -19000; test_b[10]=  -4500; test_a[11]=  14400; test_b[11]=   6200;
+        test_a[12]=  -7500; test_b[12]=  15500; test_a[13]=   9800; test_b[13]=  -9800;
+        test_a[14]= -27000; test_b[14]= -19000; test_a[15]=      0; test_b[15]=  32767;
+        // Golden model in 64-bit signed arithmetic ($signed forces a signed
+        // multiply so negative numbers are handled correctly).
+        exp_acc_sw_64 = 64'd0;
+        for (k = 0; k < 16; k = k + 1)
+            exp_acc_sw_64 = exp_acc_sw_64 + ($signed(test_a[k]) * $signed(test_b[k]));
+        stream_16_vector(2'b10);
+        check_int16_result(17, "INT16 Mixed Random Vector", exp_acc_sw_64);
+
+        // TEST 18: INT16 Max Pos
+        // (-32768) * (-32768) = 2^30; 16 of them = 2^34 = 17,179,869,184.
+        exp_acc_sw_64 = 64'd17179869184;
+        for (k = 0; k < 16; k = k + 1) begin test_a[k] = -32768; test_b[k] = -32768; end
+        stream_16_vector(2'b10);
+        check_int16_result(18, "INT16 Max Pos Corner (+17.18G)", exp_acc_sw_64);
+
+        // TEST 19: INT16 Max Neg
+        // (-32768) * 32767 = -1,073,709,056; 16 of them = -17,179,344,896.
+        exp_acc_sw_64 = -64'sd17179344896;
+        for (k = 0; k < 16; k = k + 1) begin test_a[k] = -32768; test_b[k] = 32767; end
+        stream_16_vector(2'b10);
+        check_int16_result(19, "INT16 Max Neg Corner (-17.18G)", exp_acc_sw_64);
+
+        // TEST 20: INT16 Pos*Pos
+        // 32767 * 32767 = 1,073,676,289; 16 of them = 17,178,820,624.
+        exp_acc_sw_64 = 64'd17178820624;
+        for (k = 0; k < 16; k = k + 1) begin test_a[k] = 32767; test_b[k] = 32767; end
+        stream_16_vector(2'b10);
+        check_int16_result(20, "INT16 Pos*Pos Corner (+17.18G)", exp_acc_sw_64);
+
+        // --------------------------------------------------------------------
+        // GROUP D: Mode Transitions
+        // --------------------------------------------------------------------
+        // Change precision from one run to the next, with a large result left
+        // in the accumulator. The clr_acc on element 0 must wipe the old
+        // value, and the unused upper slices must be clean in the new mode.
+        $display("\n----------------------------------------------------------------------------------");
+        $display("  TEST GROUP D: Dynamic Mode Transitions & State Bleed Isolation");
+        $display("----------------------------------------------------------------------------------");
+
+        // TEST 21: INT16 -> INT4
+        // Previous run was INT16 (big value in the upper bits). Now only one
+        // product is non-zero: 3 * 4 = 12. Everything above bit 11 must be 0.
+        for (k = 0; k < 16; k = k + 1) begin
+            test_a[k] = (k == 0) ? 3 : 0;
+            test_b[k] = (k == 0) ? 4 : 0;
+        end
+        stream_16_vector(2'b00);
+        check_int4_result(21, "Transition INT16 -> INT4 Clean", 12);
+
+        // TEST 22: INT4 -> INT8
+        // 10 * 10 = 100; 16 x 100 = 1600.
+        for (k = 0; k < 16; k = k + 1) begin test_a[k] = 10; test_b[k] = 10; end
+        stream_16_vector(2'b01);
+        check_int8_result(22, "Transition INT4 -> INT8 Clean", 1600);
+
+        // TEST 23: INT8 -> INT16
+        // 1000 * 1000 = 1,000,000; 16 x 1,000,000 = 16,000,000.
+        for (k = 0; k < 16; k = k + 1) begin test_a[k] = 1000; test_b[k] = 1000; end
+        stream_16_vector(2'b10);
+        check_int16_result(23, "Transition INT8 -> INT16 Clean", 64'd16000000);
+
+        // --------------------------------------------------------------------
+        // GROUP E: Monte Carlo
+        // --------------------------------------------------------------------
+        // Monte Carlo = use random operands. Each loop below runs 10 random
+        // 16-element dot products per precision (30 runs in total). Every run
+        // is checked inline (no helper task) and counted in the scoreboard.
+        // A failing run prints its own [FAIL] line; the [INFO] line printed
+        // after each loop only says that the loop finished.
+        $display("\n----------------------------------------------------------------------------------");
+        $display("  TEST GROUP E: Monte Carlo Randomized Stress Suite (30 Matrix Rows)");
+        $display("----------------------------------------------------------------------------------");
+
+        // Test 24: 10 random INT4
+        // Use rnd_tmp to capture $random, then slice [3:0] for proper 4-bit
+        // signed range -8..+7. ($random%16)-8 is WRONG - modulo of negative
+        // numbers in Verilog can yield -15..-9 which are out of INT4 range.
+        // Check: low 12 bits must match the golden sum, bits [35:12] must be 0.
+        for (iter = 0; iter < 10; iter = iter + 1) begin
+            exp_acc_sw = 0;
+            for (k = 0; k < 16; k = k + 1) begin
+                rnd_tmp = $random;
+                test_a[k] = {{12{rnd_tmp[3]}}, rnd_tmp[3:0]};  // sign-extend 4-bit to 16-bit
+                rnd_tmp = $random;
+                test_b[k] = {{12{rnd_tmp[3]}}, rnd_tmp[3:0]};
+                exp_acc_sw = exp_acc_sw + ($signed(test_a[k]) * $signed(test_b[k]));
+            end
+            stream_16_vector(2'b00);
+            @(posedge clk); #1;
+            total_tests = total_tests + 1;
+            if (acc_out[11:0] === exp_acc_sw[11:0] && acc_out[35:12] === 24'b0) passed_tests = passed_tests + 1;
+            else begin
+                failed_tests = failed_tests + 1;
+                $display("[FAIL] Random INT4 Run %0d: GOT=%0d EXP=%0d", iter, $signed(acc_out[11:0]), $signed(exp_acc_sw[11:0]));
+            end
+        end
+        $display("[INFO] Test 24 | Monte Carlo INT4: 10 runs complete (see scorecard for pass count).");
+
+        // Test 25: 10 random INT8
+        // Use rnd_tmp[7:0] for proper 8-bit signed range -128..+127.
+        // Check: low 20 bits must match the golden sum, bits [35:20] must be 0.
+        for (iter = 0; iter < 10; iter = iter + 1) begin
+            exp_acc_sw = 0;
+            for (k = 0; k < 16; k = k + 1) begin
+                rnd_tmp = $random;
+                test_a[k] = {{8{rnd_tmp[7]}}, rnd_tmp[7:0]};   // sign-extend 8-bit to 16-bit
+                rnd_tmp = $random;
+                test_b[k] = {{8{rnd_tmp[7]}}, rnd_tmp[7:0]};
+                exp_acc_sw = exp_acc_sw + ($signed(test_a[k]) * $signed(test_b[k]));
+            end
+            stream_16_vector(2'b01);
+            @(posedge clk); #1;
+            total_tests = total_tests + 1;
+            if (acc_out[19:0] === exp_acc_sw[19:0] && acc_out[35:20] === 16'b0) passed_tests = passed_tests + 1;
+            else begin
+                failed_tests = failed_tests + 1;
+                $display("[FAIL] Random INT8 Run %0d: GOT=%0d EXP=%0d", iter, $signed(acc_out[19:0]), $signed(exp_acc_sw[19:0]));
+            end
+        end
+        $display("[INFO] Test 25 | Monte Carlo INT8: 10 runs complete.");
+
+        // Test 26: 10 random INT16
+        // $random gives 32 random bits; assigning it to the 16-bit test
+        // arrays keeps the low 16 bits, which already cover the full INT16
+        // range. The whole 36-bit acc_out is compared with the 64-bit golden sum.
+        for (iter = 0; iter < 10; iter = iter + 1) begin
+            exp_acc_sw_64 = 64'd0;
+            for (k = 0; k < 16; k = k + 1) begin
+                test_a[k] = $random;
+                test_b[k] = $random;
+                exp_acc_sw_64 = exp_acc_sw_64 + ($signed(test_a[k]) * $signed(test_b[k]));
+            end
+            stream_16_vector(2'b10);
+            @(posedge clk); #1;
+            total_tests = total_tests + 1;
+            if (acc_out === exp_acc_sw_64[35:0]) passed_tests = passed_tests + 1;
+            else begin failed_tests = failed_tests + 1; $display("[FAIL] Random INT16 Run %0d", iter); end
+        end
+        $display("[INFO] Test 26 | Monte Carlo INT16: 10 runs complete.");
+
+        // --------------------------------------------------------------------
+        // FINAL SCORECARD
+        // --------------------------------------------------------------------
+        // Print the totals. The overall STATUS depends only on failed_tests:
+        // zero failures = everything passed. Always read this block, because
+        // it is the real result of the whole run.
+        $display("\n==================================================================================");
+        $display("                        PE TESTBENCH EXECUTION SCORECARD                          ");
+        $display("==================================================================================");
+        $display("  Total Tests Executed : %0d", total_tests);
+        $display("  Tests PASSED         : %0d", passed_tests);
+        $display("  Tests FAILED         : %0d", failed_tests);
+        if (failed_tests == 0)
+            $display("  STATUS               : *** ALL 26 TEST SUITES PASSED WITH 100%% ACCURACY! ***");
+        else
+            $display("  STATUS               : *** VERIFICATION FAILED! SEE LOG ABOVE. ***");
+        $display("==================================================================================\n");
+
+        $finish;    // stop the simulation
+    end
+
+endmodule
