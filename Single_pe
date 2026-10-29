@@ -1,0 +1,889 @@
+// ============================================================================
+// File: pe_all.v (Complete Self-Contained Processing Element)
+// Target: TSMC 65nm LP Standard-Cell Library @ 2.7 ns (370.37 MHz)
+// Features: Full Precision Scaling, 3-Way Sliced Clock Gating on BOTH
+//           Input Registers (A, B) and Accumulator Registers (Acc).
+// ============================================================================
+//
+// ----------------------------------------------------------------------------
+// OVERVIEW (read this first)
+// ----------------------------------------------------------------------------
+// This file describes ONE Processing Element (PE) of a precision-scalable
+// systolic tensor unit. A PE does a multiply-accumulate (MAC) every clock:
+//
+//        acc  <=  acc  +  (a * b)
+//
+// The PE supports three precisions, chosen by the 2-bit `mode` input:
+//
+//        mode = 2'b00  ->  INT4   (4-bit  x  4-bit  signed multiply)
+//        mode = 2'b01  ->  INT8   (8-bit  x  8-bit  signed multiply)
+//        mode = 2'b10  ->  INT16  (16-bit x 16-bit  signed multiply)
+//        mode = 2'b11  ->  unused (everything is forced to zero)
+//
+// DATA FLOW (top to bottom):
+//
+//   a_in, b_in --> [Input registers a_q, b_q] --+--> a_out, b_out (to neighbours)
+//                                               |
+//                                               v
+//                      [16x16 multiplier core, built from four 8x8 blocks,
+//                       each built from four 4x4 (5x5 signed) multipliers]
+//                                               |
+//                                               v  product[31:0]
+//                      [optional pipeline register  (PIPELINED parameter)]
+//                                               |
+//                                               v
+//                      [operand-align muxes -> 36-bit carry-select adder]
+//                                               ^        |
+//                                  acc_q (feedback)      v
+//                                      [36-bit accumulator registers]
+//                                               |
+//                                               v
+//                                       acc_out, acc_valid
+//
+// POWER IDEA (used everywhere in this file):
+//   Unused high bits are held at ZERO in the low-precision modes, so the logic
+//   fed by them does not toggle. Three "precision gates" are used:
+//        G1 = 1 in INT4, INT8, INT16   (low  nibble  [3:0]   always needed)
+//        G2 = 1 in       INT8, INT16   (mid  nibble  [7:4]   needed for 8-bit+)
+//        G3 = 1 in             INT16   (high byte    [15:8]  needed for 16-bit)
+//
+// MODULE LIST (bottom-up):
+//    1. half_adder              9. rca_4bit
+//    2. full_adder             10. carry_select_adder_36bit
+//    3. multiplier_4bit        11. accumulator_36bit
+//    4. cla_4bit               12. pe  (top level)
+//    5. cla_16bit
+//    6. cla_32bit
+//    7. int8_block
+//    8. multiplier_16bit_comb
+// ============================================================================
+`timescale 1ns / 1ps
+
+// --- 1. Half Adder ---
+// Adds two single bits. This is the smallest arithmetic building block.
+//   sum  = a XOR b   (1 when exactly one input is 1)
+//   cout = a AND b   (carry is 1 only when both inputs are 1)
+module half_adder (
+    input  wire a,      // first input bit
+    input  wire b,      // second input bit
+    output wire sum,    // 1-bit sum
+    output wire cout    // carry out to the next higher bit position
+);
+    assign sum  = a ^ b;
+    assign cout = a & b;
+endmodule
+
+// --- 2. Full Adder ---
+// Adds three single bits (a, b and an incoming carry).
+// Used everywhere: in carry-save adder (CSA) rows, in ripple-carry adders and
+// in the multiplier partial-product reduction.
+//   sum  = a XOR b XOR cin
+//   cout = majority(a, b, cin)  (1 when at least two inputs are 1)
+module full_adder (
+    input  wire a,      // first input bit
+    input  wire b,      // second input bit
+    input  wire cin,    // carry coming in from the lower bit position
+    output wire sum,    // 1-bit sum
+    output wire cout    // carry going out to the higher bit position
+);
+    assign sum  = a ^ b ^ cin;
+    assign cout = (a & b) | (b & cin) | (a & cin);
+endmodule
+
+// --- 3. 5x5 Baugh-Wooley Signed Multiplier Engine ---
+// Multiplies two 5-bit SIGNED numbers (two's complement) and gives a 10-bit
+// signed product.
+//
+// Why 5 bits when the data is 4-bit?  Each 4-bit nibble gets a 5th "sign"
+// bit from the caller (see int8_block):
+//     - nibble treated as SIGNED   -> 5th bit = nibble bit 3 (sign extension)
+//     - nibble treated as UNSIGNED -> 5th bit = 0 (value stays positive)
+// This lets the same hardware multiply signed and unsigned nibbles, which is
+// needed when a big number is split into several nibbles (only the top nibble
+// of a signed number carries the sign).
+//
+// Baugh-Wooley method: a signed multiplier normally needs subtraction for the
+// rows/columns that contain the sign bit. Baugh-Wooley rewrites those partial
+// products as INVERTED AND gates (the ~(...) terms below) plus two constant
+// "1" corrections, so the whole array uses only additions.
+module multiplier_4bit (
+    input  wire [4:0] a,    // 5-bit signed multiplicand (a[4] is the sign bit)
+    input  wire [4:0] b,    // 5-bit signed multiplier   (b[4] is the sign bit)
+    output wire [9:0] p     // 10-bit signed product
+);
+    // ---- Partial products ----
+    // Naming: ppX_Y means (bit X of a) combined with (bit Y of b).
+    // Rows 0..3 of b: normal AND, except the a[4] column which is inverted
+    // (a[4] is the sign bit of a, so its weight is negative).
+    wire pp0_0 =   a[0] & b[0];
+    wire pp1_0 =   a[1] & b[0];
+    wire pp2_0 =   a[2] & b[0];
+    wire pp3_0 =   a[3] & b[0];
+    wire pp4_0 = ~(a[4] & b[0]);   // sign column -> inverted (Baugh-Wooley)
+
+    wire pp0_1 =   a[0] & b[1];
+    wire pp1_1 =   a[1] & b[1];
+    wire pp2_1 =   a[2] & b[1];
+    wire pp3_1 =   a[3] & b[1];
+    wire pp4_1 = ~(a[4] & b[1]);   // sign column -> inverted
+
+    wire pp0_2 =   a[0] & b[2];
+    wire pp1_2 =   a[1] & b[2];
+    wire pp2_2 =   a[2] & b[2];
+    wire pp3_2 =   a[3] & b[2];
+    wire pp4_2 = ~(a[4] & b[2]);   // sign column -> inverted
+
+    wire pp0_3 =   a[0] & b[3];
+    wire pp1_3 =   a[1] & b[3];
+    wire pp2_3 =   a[2] & b[3];
+    wire pp3_3 =   a[3] & b[3];
+    wire pp4_3 = ~(a[4] & b[3]);   // sign column -> inverted
+
+    // Row 4 of b is the sign row of b, so its terms are inverted instead,
+    // except the very last one (a[4] & b[4]) where two negatives multiply to
+    // a positive, so it stays a plain AND.
+    wire pp0_4 = ~(a[0] & b[4]);
+    wire pp1_4 = ~(a[1] & b[4]);
+    wire pp2_4 = ~(a[2] & b[4]);
+    wire pp3_4 = ~(a[3] & b[4]);
+    wire pp4_4 =   a[4] & b[4];
+
+    // p[0] is just the single partial product in column 0, no addition needed.
+    assign p[0] = pp0_0;
+
+    // ---- Stage 1: add rows 0 and 1 (half adders, only 2 inputs per column) ----
+    wire s1_0, c1_0, s1_1, c1_1, s1_2, c1_2, s1_3, c1_3;
+    half_adder ha1_0 (.a(pp1_0), .b(pp0_1), .sum(s1_0), .cout(c1_0));
+    assign p[1] = s1_0;            // column 1 is finished here
+    half_adder ha1_1 (.a(pp2_0), .b(pp1_1), .sum(s1_1), .cout(c1_1));
+    half_adder ha1_2 (.a(pp3_0), .b(pp2_1), .sum(s1_2), .cout(c1_2));
+    half_adder ha1_3 (.a(pp4_0), .b(pp3_1), .sum(s1_3), .cout(c1_3));
+
+    // ---- Stage 2: fold in row 2 (full adders: sum + next pp + carry) ----
+    wire s2_0, c2_0, s2_1, c2_1, s2_2, c2_2, s2_3, c2_3;
+    full_adder fa2_0 (.a(s1_1), .b(pp0_2), .cin(c1_0), .sum(s2_0), .cout(c2_0));
+    assign p[2] = s2_0;            // column 2 is finished here
+    full_adder fa2_1 (.a(s1_2), .b(pp1_2), .cin(c1_1), .sum(s2_1), .cout(c2_1));
+    full_adder fa2_2 (.a(s1_3), .b(pp2_2), .cin(c1_2), .sum(s2_2), .cout(c2_2));
+    full_adder fa2_3 (.a(pp4_1), .b(pp3_2), .cin(c1_3), .sum(s2_3), .cout(c2_3));
+
+    // ---- Stage 3: fold in row 3 ----
+    wire s3_0, c3_0, s3_1, c3_1, s3_2, c3_2, s3_3, c3_3;
+    full_adder fa3_0 (.a(s2_1), .b(pp0_3), .cin(c2_0), .sum(s3_0), .cout(c3_0));
+    assign p[3] = s3_0;            // column 3 is finished here
+    full_adder fa3_1 (.a(s2_2), .b(pp1_3), .cin(c2_1), .sum(s3_1), .cout(c3_1));
+    full_adder fa3_2 (.a(s2_3), .b(pp2_3), .cin(c2_2), .sum(s3_2), .cout(c3_2));
+    full_adder fa3_3 (.a(pp4_2), .b(pp3_3), .cin(c2_3), .sum(s3_3), .cout(c3_3));
+
+    // ---- Stage 4: fold in row 4 (the sign row of b) ----
+    wire s4_0, c4_0, s4_1, c4_1, s4_2, c4_2, s4_3, c4_3;
+    full_adder fa4_0 (.a(s3_1), .b(pp0_4), .cin(c3_0), .sum(s4_0), .cout(c4_0));
+    assign p[4] = s4_0;            // column 4 is finished here
+    full_adder fa4_1 (.a(s3_2), .b(pp1_4), .cin(c3_1), .sum(s4_1), .cout(c4_1));
+    full_adder fa4_2 (.a(s3_3), .b(pp2_4), .cin(c3_2), .sum(s4_2), .cout(c4_2));
+    full_adder fa4_3 (.a(pp4_3), .b(pp3_4), .cin(c3_3), .sum(s4_3), .cout(c4_3));
+
+    // ---- Final ripple-carry row: adds the leftover sums and carries ----
+    // The first carry-in is the constant 1 (first Baugh-Wooley correction).
+    wire rc_c5, rc_c6, rc_c7, rc_c8;
+    full_adder fa_rc5 (.a(s4_1),  .b(c4_0), .cin(1'b1),  .sum(p[5]), .cout(rc_c5));
+    full_adder fa_rc6 (.a(s4_2),  .b(c4_1), .cin(rc_c5), .sum(p[6]), .cout(rc_c6));
+    full_adder fa_rc7 (.a(s4_3),  .b(c4_2), .cin(rc_c6), .sum(p[7]), .cout(rc_c7));
+    full_adder fa_rc8 (.a(pp4_4), .b(c4_3), .cin(rc_c7), .sum(p[8]), .cout(rc_c8));
+
+    // Top bit: the inverted final carry is the second Baugh-Wooley correction
+    // (equivalent to adding a constant 1 at bit 9). It gives the sign bit.
+    assign p[9] = ~rc_c8;
+endmodule
+
+// --- 4. 4-Bit Carry-Lookahead Adder ---
+// Adds two 4-bit numbers WITHOUT waiting for the carry to ripple bit by bit.
+// For every bit it computes two helper signals:
+//     p (propagate) = a XOR b : this bit passes an incoming carry along
+//     g (generate)  = a AND b : this bit creates a carry by itself
+// Each carry is then written directly as a flat AND-OR expression of the
+// p/g signals and cin, so all carries are ready at about the same time.
+// The module also outputs GROUP propagate/generate (P_group, G_group) so
+// that cla_16bit can chain four of these adders with a second lookahead level.
+module cla_4bit (
+    input  wire [3:0] a,        // 4-bit operand A
+    input  wire [3:0] b,        // 4-bit operand B
+    input  wire       cin,      // carry coming into bit 0
+    output wire [3:0] sum,      // 4-bit sum
+    output wire       cout,     // carry out of bit 3
+    output wire       P_group,  // 1 if the whole 4-bit group passes a carry through
+    output wire       G_group   // 1 if the 4-bit group generates a carry by itself
+);
+    wire [3:0] p = a ^ b;       // per-bit propagate
+    wire [3:0] g = a & b;       // per-bit generate
+
+    // Carry into bit 1: bit 0 generates a carry, or bit 0 propagates cin.
+    wire c1 = g[0] | (p[0] & cin);
+    // Carry into bit 2: expanded so it does not wait for c1.
+    wire c2 = g[1] | (p[1] & g[0]) | (p[1] & p[0] & cin);
+    // Carry into bit 3.
+    wire c3 = g[2] | (p[2] & g[1]) | (p[2] & p[1] & g[0]) | (p[2] & p[1] & p[0] & cin);
+    // Carry out of bit 3.
+    wire c4 = g[3] | (p[3] & g[2]) | (p[3] & p[2] & g[1]) | (p[3] & p[2] & p[1] & g[0]) | (p[3] & p[2] & p[1] & p[0] & cin);
+
+    // Sum bit = propagate XOR the carry coming into that bit.
+    assign sum[0] = p[0] ^ cin;
+    assign sum[1] = p[1] ^ c1;
+    assign sum[2] = p[2] ^ c2;
+    assign sum[3] = p[3] ^ c3;
+    assign cout   = c4;
+
+    // Group signals for the next lookahead level (used by cla_16bit):
+    //   P_group: every bit propagates, so a carry-in goes straight through.
+    //   G_group: the group makes a carry even when cin = 0.
+    assign P_group = p[3] & p[2] & p[1] & p[0];
+    assign G_group = g[3] | (p[3] & g[2]) | (p[3] & p[2] & g[1]) | (p[3] & p[2] & p[1] & g[0]);
+endmodule
+
+// --- 5. 16-Bit Carry-Lookahead Adder ---
+// Two-level lookahead: four cla_4bit groups, plus a second lookahead layer
+// that computes the carry into each group from the group P/G signals.
+// This is the final adder of every int8_block (16-bit result).
+module cla_16bit (
+    input  wire [15:0] a,       // 16-bit operand A
+    input  wire [15:0] b,       // 16-bit operand B
+    input  wire        cin,     // carry-in to bit 0
+    output wire [15:0] sum,     // 16-bit sum
+    output wire        cout     // carry out of bit 15
+);
+    wire [3:0] P_grp, G_grp;    // group propagate / generate from the four 4-bit CLAs
+    wire [4:0] c;               // c[i] = carry INTO group i; c[4] = final carry out
+    assign c[0] = cin;
+
+    // Second-level lookahead: same formula as inside cla_4bit, but applied to
+    // whole groups instead of single bits.
+    assign c[1] = G_grp[0] | (P_grp[0] & c[0]);
+    assign c[2] = G_grp[1] | (P_grp[1] & G_grp[0]) | (P_grp[1] & P_grp[0] & c[0]);
+    assign c[3] = G_grp[2] | (P_grp[2] & G_grp[1]) | (P_grp[2] & P_grp[1] & G_grp[0]) | (P_grp[2] & P_grp[1] & P_grp[0] & c[0]);
+    assign c[4] = G_grp[3] | (P_grp[3] & G_grp[2]) | (P_grp[3] & P_grp[2] & G_grp[1]) | (P_grp[3] & P_grp[2] & P_grp[1] & G_grp[0]) | (P_grp[3] & P_grp[2] & P_grp[1] & P_grp[0] & c[0]);
+
+    // Four 4-bit groups. Each one receives its own carry-in from c[] above, so
+    // the groups work in parallel. Their own cout is left unconnected because
+    // the group carries are already computed in c[].
+    cla_4bit u_cla0 (.a(a[3:0]),   .b(b[3:0]),   .cin(c[0]), .sum(sum[3:0]),   .cout(), .P_group(P_grp[0]), .G_group(G_grp[0]));
+    cla_4bit u_cla1 (.a(a[7:4]),   .b(b[7:4]),   .cin(c[1]), .sum(sum[7:4]),   .cout(), .P_group(P_grp[1]), .G_group(G_grp[1]));
+    cla_4bit u_cla2 (.a(a[11:8]),  .b(b[11:8]),  .cin(c[2]), .sum(sum[11:8]),  .cout(), .P_group(P_grp[2]), .G_group(G_grp[2]));
+    cla_4bit u_cla3 (.a(a[15:12]), .b(b[15:12]), .cin(c[3]), .sum(sum[15:12]), .cout(), .P_group(P_grp[3]), .G_group(G_grp[3]));
+    assign cout = c[4];
+endmodule
+
+// --- 6. 32-Bit Carry-Lookahead Adder ---
+// Two cla_16bit adders chained: the lower half's carry-out feeds the upper
+// half's carry-in. Used as the final adder of the 16x16 multiplier (INT16).
+module cla_32bit (
+    input  wire [31:0] a,       // 32-bit operand A
+    input  wire [31:0] b,       // 32-bit operand B
+    input  wire        cin,     // carry-in to bit 0
+    output wire [31:0] sum,     // 32-bit sum
+    output wire        cout     // carry out of bit 31
+);
+    wire c16;                   // carry between lower and upper 16-bit halves
+    cla_16bit u_cla_lower (.a(a[15:0]),  .b(b[15:0]),  .cin(cin), .sum(sum[15:0]),  .cout(c16));
+    cla_16bit u_cla_upper (.a(a[31:16]), .b(b[31:16]), .cin(c16), .sum(sum[31:16]), .cout(cout));
+endmodule
+
+// --- 7. 8x8 Multiplier Engine (int8_block) ---
+// Builds an 8x8 multiply out of FOUR 4x4 multiplies (using multiplier_4bit).
+// Write each 8-bit operand as two nibbles:  a = {a_hi, a_lo},  b = {b_hi, b_lo}
+//     a*b = a_lo*b_lo  +  (a_hi*b_lo + a_lo*b_hi) * 2^4  +  a_hi*b_hi * 2^8
+//
+//   mult0 = a_lo * b_lo   shifted left by 0
+//   mult1 = a_hi * b_lo   shifted left by 4
+//   mult2 = a_lo * b_hi   shifted left by 4
+//   mult3 = a_hi * b_hi   shifted left by 8
+//
+// The four shifted products are added with a 2-level carry-save tree and a
+// final 16-bit carry-lookahead adder. The Sx/Sy inputs say which nibbles are
+// signed (see below) and g2 is a power-saving gate for INT4 mode.
+module int8_block (
+    input  wire [7:0]  a,       // 8-bit operand A
+    input  wire [7:0]  b,       // 8-bit operand B
+    input  wire [3:0]  Sx,      // signed-enable per sub-multiplier, for the A nibble
+    input  wire [3:0]  Sy,      // signed-enable per sub-multiplier, for the B nibble
+    input  wire        g2,      // 1 in INT8/INT16, 0 in INT4 (gates unused mults)
+    output wire [15:0] z        // 16-bit product of this 8x8 block
+);
+    // Split each operand into low and high nibble.
+    wire [3:0] a_lo = a[3:0];
+    wire [3:0] a_hi = a[7:4];
+    wire [3:0] b_lo = b[3:0];
+    wire [3:0] b_hi = b[7:4];
+
+    // POWER GATING INSIDE THE BLOCK (INT4 mode, g2 = 0):
+    // In INT4 only mult0 does useful work. mult1 uses b_lo and mult2 uses a_lo,
+    // so those two nibbles are forced to zero when g2 = 0. That keeps mult1 and
+    // mult2 completely quiet instead of toggling for nothing.
+    wire [3:0] b_lo_m1 = b_lo & {4{g2}};    // b_lo as seen by mult1
+    wire [3:0] a_lo_m2 = a_lo & {4{g2}};    // a_lo as seen by mult2
+
+    // Build the 5-bit signed operands for each 4x4 multiplier:
+    //   {Sx & nibble[3], nibble}  -> if Sx=1 the nibble is SIGNED (bit 3 is
+    //   copied into the new 5th bit); if Sx=0 it is UNSIGNED (5th bit = 0).
+    // Sx[n]/Sy[n] belong to sub-multiplier n (mult0..mult3).
+    wire [4:0] a5_m0 = {Sx[0] & a_lo[3], a_lo};
+    wire [4:0] b5_m0 = {Sy[0] & b_lo[3], b_lo};
+    wire [4:0] a5_m1 = {Sx[1] & a_hi[3], a_hi};
+    wire [4:0] b5_m1 = {Sy[1] & b_lo_m1[3], b_lo_m1};
+    wire [4:0] a5_m2 = {Sx[2] & a_lo_m2[3], a_lo_m2};
+    wire [4:0] b5_m2 = {Sy[2] & b_hi[3], b_hi};
+    wire [4:0] a5_m3 = {Sx[3] & a_hi[3], a_hi};
+    wire [4:0] b5_m3 = {Sy[3] & b_hi[3], b_hi};
+
+    // The four 4x4 (5x5 signed) multipliers; each gives a 10-bit raw product.
+    wire [9:0] p0_raw, p1_raw, p2_raw, p3_raw;
+    multiplier_4bit u_mult0 (.a(a5_m0), .b(b5_m0), .p(p0_raw));
+    multiplier_4bit u_mult1 (.a(a5_m1), .b(b5_m1), .p(p1_raw));
+    multiplier_4bit u_mult2 (.a(a5_m2), .b(b5_m2), .p(p2_raw));
+    multiplier_4bit u_mult3 (.a(a5_m3), .b(b5_m3), .p(p3_raw));
+
+    // Place each raw product at its shifted position inside a 16-bit word
+    // (P0..P3 are the shifted, sign-extended versions).
+    wire [15:0] P0, P1, P2, P3;
+
+    // P0: shift 0. Bits 8 and 9 (and the sign extension above) are only
+    // meaningful when g2 = 1; in INT4 they are forced to 0 because the INT4
+    // result only needs the low 8 bits.
+    assign P0[7:0]   = p0_raw[7:0];
+    assign P0[8]     = g2 & p0_raw[8];
+    assign P0[9]     = g2 & p0_raw[9];
+    assign P0[15:10] = {6{g2 & p0_raw[9]}};     // sign extension, also gated by g2
+
+    // P1: shift left by 4 (low 4 bits are zero), sign-extended on the top.
+    assign P1[3:0]   = 4'b0000;
+    assign P1[13:4]  = p1_raw[9:0];
+    assign P1[15:14] = {2{p1_raw[9]}};
+
+    // P2: shift left by 4, same layout as P1.
+    assign P2[3:0]   = 4'b0000;
+    assign P2[13:4]  = p2_raw[9:0];
+    assign P2[15:14] = {2{p2_raw[9]}};
+
+    // P3: shift left by 8. Only the low 8 bits of p3_raw fit in 16 bits.
+    assign P3[7:0]   = 8'b0000_0000;
+    assign P3[15:8]  = p3_raw[7:0];
+
+    // ---- Carry-save stage 1: compress P0 + P1 + P2 into sum s1 and carry c1 ----
+    // One full adder per bit; no carry travels along the row, so it is fast.
+    wire [15:0] s1, c1;
+    genvar i;
+    generate
+        for (i = 0; i < 16; i = i + 1) begin : gen_csa_stage1
+            full_adder fa_st1 (.a(P0[i]), .b(P1[i]), .cin(P2[i]), .sum(s1[i]), .cout(c1[i]));
+        end
+    endgenerate
+
+    // ---- Carry-save stage 2: add P3 into (s1, c1) -> new sum s2, carry c2 ----
+    // The carries from stage 1 are worth one bit more, so c1[i-1] is added at
+    // bit i. Bit 0 has no incoming carry, so its second input is 0.
+    wire [15:0] s2, c2;
+    full_adder fa_st2_0 (.a(s1[0]), .b(1'b0), .cin(P3[0]), .sum(s2[0]), .cout(c2[0]));
+    generate
+        for (i = 1; i < 16; i = i + 1) begin : gen_csa_stage2
+            full_adder fa_st2 (.a(s1[i]), .b(c1[i-1]), .cin(P3[i]), .sum(s2[i]), .cout(c2[i]));
+        end
+    endgenerate
+
+    // ---- Final carry-propagate adder: s2 + (c2 shifted left by 1) ----
+    // Turns the redundant (sum, carry) form into one ordinary 16-bit number.
+    cla_16bit u_final_cla (.a(s2), .b({c2[14:0], 1'b0}), .cin(1'b0), .sum(z), .cout());
+endmodule
+
+// --- 8. 16x16 Combinational Multiplier Core ---
+// Builds a 16x16 multiply out of FOUR 8x8 blocks (int8_block). With
+// A = {aH, aL} and B = {bH, bL} (H = bits [15:8], L = bits [7:0]):
+//
+//   A*B = aL*bL  +  (aH*bL + aL*bH) * 2^8  +  aH*bH * 2^16
+//
+//   block0 -> z0 = aL * bL   (shift  0)
+//   block1 -> z1 = aH * bL   (shift  8)
+//   block2 -> z2 = aL * bH   (shift  8)
+//   block3 -> z3 = aH * bH   (shift 16)
+//
+// The same hardware also gives the lower precisions:
+//   INT4  : only block0 / mult0 does real work  -> 4x4  result in z0[7:0]
+//   INT8  : block0 alone gives the full 8x8 result in z0[15:0]
+//   INT16 : all four blocks are summed
+// Purely combinational (no clock); the registers are in the top-level pe.
+module multiplier_16bit_comb (
+    input  wire [1:0]  mode,        // 00 = INT4, 01 = INT8, 10 = INT16
+    input  wire [15:0] a,           // 16-bit operand A
+    input  wire [15:0] b,           // 16-bit operand B
+    output wire [31:0] product      // 32-bit signed product
+);
+    // Decode the mode into one-hot enables, then into the nested gates.
+    wire en_int4  = (mode == 2'b00);
+    wire en_int8  = (mode == 2'b01);
+    wire en_int16 = (mode == 2'b10);
+
+    wire G1 = en_int4 | en_int8 | en_int16;     // low  nibble  active
+    wire G2 = en_int8 | en_int16;               // mid  nibble  active
+    wire G3 = en_int16;                         // high byte    active
+    wire g2 = G2;                               // same as G2, passed into block0
+
+    // OPERAND ISOLATION: bits that the current precision does not use are
+    // ANDed to 0, so unused parts of the multiplier see constant zeros and
+    // stop switching. Slices follow the register slices in the top module:
+    //   [3:0] by G1,  [7:4] by G2,  [15:8] by G3.
+    wire [15:0] a_iso = {(a[15:8] & {8{G3}}), (a[7:4] & {4{G2}}), (a[3:0] & {4{G1}})};
+    wire [15:0] b_iso = {(b[15:8] & {8{G3}}), (b[7:4] & {4{G2}}), (b[3:0] & {4{G1}})};
+
+    // SIGN CONTROL (sx / sy): says WHICH nibble holds the sign bit in the
+    // current precision (that nibble is multiplied as signed, the rest as
+    // unsigned):
+    //   INT4  -> sx = 0001 : low  nibble of the low  byte  (bits [3:0])
+    //   INT8  -> sx = 0010 : high nibble of the low  byte  (bits [7:4])
+    //   INT16 -> sx = 1000 : high nibble of the high byte  (bits [15:12])
+    // The B operand uses the same pattern (sy = sx).
+    wire [3:0] sx = en_int4 ? 4'b0001 : (en_int8 ? 4'b0010 : (en_int16 ? 4'b1000 : 4'b0000));
+    wire [3:0] sy = sx;
+
+    // Distribute the sign flags to the four sub-multipliers of each block.
+    // (Bit n of Sx/Sy belongs to sub-multiplier n of that block.)
+    // Block0 works on A low byte, B low byte:
+    wire [3:0] Sx_b0 = {sx[1], sx[0], sx[1], sx[0]};
+    wire [3:0] Sy_b0 = {sy[1], sy[1], sy[0], sy[0]};
+    // Block1 works on A high byte, B low byte:
+    wire [3:0] Sx_b1 = {sx[3], sx[2], sx[3], sx[2]};
+    wire [3:0] Sy_b1 = {sy[1], sy[1], sy[0], sy[0]};
+    // Block2 works on A low byte, B high byte:
+    wire [3:0] Sx_b2 = {sx[1], sx[0], sx[1], sx[0]};
+    wire [3:0] Sy_b2 = {sy[3], sy[3], sy[2], sy[2]};
+    // Block3 works on A high byte, B high byte:
+    wire [3:0] Sx_b3 = {sx[3], sx[2], sx[3], sx[2]};
+    wire [3:0] Sy_b3 = {sy[3], sy[3], sy[2], sy[2]};
+
+    // The four 8x8 blocks. Blocks 1..3 are only needed in INT16, so their
+    // inputs are additionally gated:
+    //   block1: B low  byte ANDed with G3 (its A input is a_iso[15:8], already G3-gated)
+    //   block2: A low  byte ANDed with G3 (its B input is b_iso[15:8], already G3-gated)
+    //   block3: both inputs already G3-gated by a_iso / b_iso
+    // Their g2 pin is tied to 1 because they are used only in INT16.
+    wire [15:0] z0, z1, z2, z3;
+    int8_block u_block0 (.a(a_iso[7:0]), .b(b_iso[7:0]), .Sx(Sx_b0), .Sy(Sy_b0), .g2(g2), .z(z0));
+    int8_block u_block1 (.a(a_iso[15:8]), .b(b_iso[7:0] & {8{G3}}), .Sx(Sx_b1), .Sy(Sy_b1), .g2(1'b1), .z(z1));
+    int8_block u_block2 (.a(a_iso[7:0] & {8{G3}}), .b(b_iso[15:8]), .Sx(Sx_b2), .Sy(Sy_b2), .g2(1'b1), .z(z2));
+    int8_block u_block3 (.a(a_iso[15:8]), .b(b_iso[15:8]), .Sx(Sx_b3), .Sy(Sy_b3), .g2(1'b1), .z(z3));
+
+    // Align the four block results to 32 bits at their weights:
+    //   V0 : weight 2^0   (gated by G3 so the whole 32-bit adder tree is
+    //                      frozen in INT4/INT8, where V0 is not used)
+    //   V1 : weight 2^8   (sign-extended on top, zeros below)
+    //   V2 : weight 2^8   (sign-extended on top, zeros below)
+    //   V3 : weight 2^16  (zeros below)
+    wire [31:0] V0 = {16'b0, z0 & {16{G3}}};
+    wire [31:0] V1 = {{8{z1[15]}}, z1, 8'b0};
+    wire [31:0] V2 = {{8{z2[15]}}, z2, 8'b0};
+    wire [31:0] V3 = {z3, 16'b0};
+
+    // ---- 32-bit carry-save stage 1: V0 + V1 + V2 -> (s1, c1) ----
+    wire [31:0] s1, c1;
+    genvar k;
+    generate
+        for (k = 0; k < 32; k = k + 1) begin : gen_csa32_st1
+            full_adder fa32_st1 (.a(V0[k]), .b(V1[k]), .cin(V2[k]), .sum(s1[k]), .cout(c1[k]));
+        end
+    endgenerate
+
+    // ---- 32-bit carry-save stage 2: add V3 -> (s2, c2) ----
+    // Carries from stage 1 enter one bit higher (c1[k-1] at bit k).
+    wire [31:0] s2, c2;
+    full_adder fa32_st2_0 (.a(s1[0]), .b(1'b0), .cin(V3[0]), .sum(s2[0]), .cout(c2[0]));
+    generate
+        for (k = 1; k < 32; k = k + 1) begin : gen_csa32_st2
+            full_adder fa32_st2 (.a(s1[k]), .b(c1[k-1]), .cin(V3[k]), .sum(s2[k]), .cout(c2[k]));
+        end
+    endgenerate
+
+    // ---- Final 32-bit carry-lookahead add of sum and (shifted) carry ----
+    wire [31:0] sum_int16_32b;
+    cla_32bit u_cla32 (.a(s2), .b({c2[30:0], 1'b0}), .cin(1'b0), .sum(sum_int16_32b), .cout());
+
+    // OUTPUT MUX: pick the right result for the current precision and
+    // sign-extend smaller results to the full 32 bits.
+    //   INT4  : 8-bit  result z0[7:0]  sign-extended to 32 bits
+    //   INT8  : 16-bit result z0[15:0] sign-extended to 32 bits
+    //   INT16 : full 32-bit sum from the adder tree
+    //   other : 0
+    assign product = en_int4  ? {{24{z0[7]}},  z0[7:0]} :
+                     en_int8  ? {{16{z0[15]}}, z0[15:0]} :
+                     en_int16 ? sum_int16_32b : 32'd0;
+endmodule
+
+// --- 9. 4-Bit Ripple-Carry Adder Block ---
+// Four full adders in a row: the carry "ripples" from bit 0 up to bit 3.
+// Small and cheap. It is the building block of the carry-select adder below.
+module rca_4bit (
+    input  wire [3:0] a,        // 4-bit operand A
+    input  wire [3:0] b,        // 4-bit operand B
+    input  wire       cin,      // carry-in to bit 0
+    output wire [3:0] sum,      // 4-bit sum
+    output wire       cout      // carry out of bit 3
+);
+    wire [4:0] c;               // c[i] = carry into bit i, c[4] = carry out
+    assign c[0] = cin;
+    genvar i;
+    generate
+        for (i = 0; i < 4; i = i + 1) begin : gen_fa
+            full_adder fa_inst (.a(a[i]), .b(b[i]), .cin(c[i]), .sum(sum[i]), .cout(c[i+1]));
+        end
+    endgenerate
+    assign cout = c[4];
+endmodule
+
+// --- 10. 36-Bit Carry-Select Adder with Carry Stop ---
+// Adds two 36-bit numbers using nine 4-bit sections.
+//
+// CARRY-SELECT IDEA: for every section after the first, TWO ripple adders
+// are built, one assuming carry-in = 0 and one assuming carry-in = 1. Both
+// run at the same time. When the real carry from the section below arrives,
+// a mux just picks the correct pair of (sum, carry-out). This is faster than
+// letting the carry ripple through all nine sections.
+//
+// CARRY STOP (power / precision gating): the carry is deliberately cut at the
+// section boundaries of the precision slices, so that in low-precision modes
+// the upper slices cannot receive a carry from the lower ones:
+//     boundary after bit 11 -> only passes in INT8/INT16 (g_int8_or_int16)
+//     boundary after bit 19 -> only passes in INT16      (g_int16)
+// Slices:  [11:0] INT4+ | [19:12] INT8+ | [35:20] INT16 only
+module carry_select_adder_36bit (
+    input  wire [35:0] a,                   // operand A (product coming from the multiplier)
+    input  wire [35:0] b,                   // operand B (accumulator feedback)
+    input  wire        cin,                 // carry-in to bit 0
+    input  wire        g_int8_or_int16,     // 1 lets the carry cross bit 11 -> 12
+    input  wire        g_int16,             // 1 lets the carry cross bit 19 -> 20
+    output wire [35:0] sum,                 // 36-bit sum
+    output wire        cout                 // carry out of bit 35
+);
+    wire [9:0] c;                           // c[i] = carry INTO section i (section = 4 bits)
+    assign c[0] = cin;
+
+    // ---- Section 0: bits [3:0] --- a single ripple adder, no select needed ----
+    rca_4bit sec0_rca (.a(a[3:0]), .b(b[3:0]), .cin(c[0]), .sum(sum[3:0]), .cout(c[1]));
+
+    // ---- Section 1: bits [7:4] --- two adders, mux picks by carry c[1] ----
+    wire [3:0] s1_n, s1_y;                  // sums assuming carry-in = 0 (n) / 1 (y)
+    wire       c1_n, c1_y;                  // carry-outs for those two cases
+    rca_4bit sec1_rca_0 (.a(a[7:4]), .b(b[7:4]), .cin(1'b0), .sum(s1_n), .cout(c1_n));
+    rca_4bit sec1_rca_1 (.a(a[7:4]), .b(b[7:4]), .cin(1'b1), .sum(s1_y), .cout(c1_y));
+    assign sum[7:4] = c[1] ? s1_y : s1_n;
+    assign c[2]     = c[1] ? c1_y : c1_n;
+
+    // ---- Section 2: bits [11:8] --- last section of slice 1 ----
+    // Its carry-out is the carry into bit 12, so it is the FIRST carry stop:
+    // it only passes in INT8/INT16.
+    wire [3:0] s2_n, s2_y;
+    wire       c2_n, c2_y;
+    rca_4bit sec2_rca_0 (.a(a[11:8]), .b(b[11:8]), .cin(1'b0), .sum(s2_n), .cout(c2_n));
+    rca_4bit sec2_rca_1 (.a(a[11:8]), .b(b[11:8]), .cin(1'b1), .sum(s2_y), .cout(c2_y));
+    assign sum[11:8] = c[2] ? s2_y : s2_n;
+    wire raw_c3      = c[2] ? c2_y : c2_n;     // real carry before the stop
+    assign c[3]      = raw_c3 & g_int8_or_int16; // carry stop #1 (blocks it in INT4)
+
+    // ---- Section 3: bits [15:12] --- first section of slice 2 ----
+    wire [3:0] s3_n, s3_y;
+    wire       c3_n, c3_y;
+    rca_4bit sec3_rca_0 (.a(a[15:12]), .b(b[15:12]), .cin(1'b0), .sum(s3_n), .cout(c3_n));
+    rca_4bit sec3_rca_1 (.a(a[15:12]), .b(b[15:12]), .cin(1'b1), .sum(s3_y), .cout(c3_y));
+    assign sum[15:12] = c[3] ? s3_y : s3_n;
+    assign c[4]       = c[3] ? c3_y : c3_n;
+
+    // ---- Section 4: bits [19:16] --- last section of slice 2 ----
+    // Its carry-out is the carry into bit 20, so it is the SECOND carry stop:
+    // it only passes in INT16.
+    wire [3:0] s4_n, s4_y;
+    wire       c4_n, c4_y;
+    rca_4bit sec4_rca_0 (.a(a[19:16]), .b(b[19:16]), .cin(1'b0), .sum(s4_n), .cout(c4_n));
+    rca_4bit sec4_rca_1 (.a(a[19:16]), .b(b[19:16]), .cin(1'b1), .sum(s4_y), .cout(c4_y));
+    assign sum[19:16] = c[4] ? s4_y : s4_n;
+    wire raw_c5       = c[4] ? c4_y : c4_n;     // real carry before the stop
+    assign c[5]       = raw_c5 & g_int16;       // carry stop #2 (blocks it in INT4/INT8)
+
+    // ---- Sections 5..8: bits [35:20] --- slice 3 (INT16 only) ----
+    // Same two-adder + mux structure, written as a loop. `LO` is the lowest
+    // bit of the current section (sec*4); `+: 4` selects a 4-bit window.
+    genvar sec;
+    generate
+        for (sec = 5; sec < 9; sec = sec + 1) begin : gen_upper_secs
+            localparam LO = sec * 4;
+            wire [3:0] sn, sy;                  // sums for carry-in 0 / 1
+            wire       cn, cy;                  // carry-outs for carry-in 0 / 1
+            rca_4bit rca_0 (.a(a[LO +: 4]), .b(b[LO +: 4]), .cin(1'b0), .sum(sn), .cout(cn));
+            rca_4bit rca_1 (.a(a[LO +: 4]), .b(b[LO +: 4]), .cin(1'b1), .sum(sy), .cout(cy));
+            assign sum[LO +: 4] = c[sec] ? sy : sn;
+            assign c[sec+1]     = c[sec] ? cy : cn;
+        end
+    endgenerate
+    assign cout = c[9];                         // carry out of the top section
+endmodule
+
+// --- 11. 36-Bit Sliced Gated Accumulator ---
+// Holds the running sum: every valid cycle it adds the new product to the
+// stored value and writes the result back (acc = acc + product).
+//
+// The 36 register bits are split into three SLICES that are enabled
+// independently, so unused slices stay frozen in low-precision modes:
+//     Slice 1 : bits [11:0]   active in INT4, INT8, INT16   (gate G1)
+//     Slice 2 : bits [19:12]  active in       INT8, INT16   (gate G2)
+//     Slice 3 : bits [35:20]  active in             INT16   (gate G3)
+//
+// Why 36 bits? The largest product is 32 bits and extra headroom bits let
+// many products be accumulated without overflow.
+module accumulator_36bit (
+    input  wire        clk,         // clock
+    input  wire        rst_n,       // active-low asynchronous reset
+    input  wire        clr_acc,     // 1 = start a new sum (drop the old accumulator value)
+    input  wire        acc_en,      // 1 = a valid product is present this cycle
+    input  wire [1:0]  mode,        // precision mode (00 INT4, 01 INT8, 10 INT16)
+    input  wire [31:0] product,     // product coming from the multiplier (or pipeline reg)
+    output wire [35:0] acc_out,     // current accumulator value
+    output reg         acc_valid    // 1 once the accumulator holds a valid result
+);
+    // Decode the mode (same decoding as in the multiplier and in pe).
+    wire en_int4  = (mode == 2'b00);
+    wire en_int8  = (mode == 2'b01);
+    wire en_int16 = (mode == 2'b10);
+
+    wire G1 = en_int4 | en_int8 | en_int16;
+    wire G2 = en_int8 | en_int16;
+    wire G3 = en_int16;
+
+    // ---- OPERAND ALIGN: fit the 32-bit product into the 36-bit lanes ----
+    // The product is split into three fields that match the slices. Fields
+    // that the current precision does not use are forced to ZERO so the adder
+    // inputs for those slices stay quiet.
+    //
+    //   lo  (12 bits): INT4  -> product[7:0] sign-extended to 12 bits
+    //                  other -> product[11:0]
+    //   mid ( 8 bits): INT4  -> 0
+    //                  INT8  -> product[15] sign-extended + product[15:12]
+    //                  INT16 -> product[19:12]
+    //   hi  (16 bits): INT4/INT8 -> 0
+    //                  INT16     -> product[31] sign-extended + product[31:20]
+    wire [11:0] mult_op_lo  = en_int4 ? {{4{product[7]}}, product[7:0]} : product[11:0];
+    wire [7:0]  mult_op_mid = en_int4 ? 8'd0 : (en_int8 ? {{4{product[15]}}, product[15:12]} : product[19:12]);
+    wire [15:0] mult_op_hi  = (en_int4 | en_int8) ? 16'd0 : {{4{product[31]}}, product[31:20]};
+
+    // Glue the three fields back into one 36-bit operand for the adder.
+    wire [35:0] mult_to_adder = {mult_op_hi, mult_op_mid, mult_op_lo};
+
+    // Accumulator register and its feedback path.
+    reg  [35:0] acc_q;                          // stored accumulator value
+    wire [35:0] acc_fb = clr_acc ? 36'd0 : acc_q;   // clr_acc: add to 0 instead of the old value
+    wire [35:0] sum_next;                       // acc + product, to be stored next
+
+    // The 36-bit adder: A = new product, B = old accumulator (or zero).
+    // The two gate inputs implement the carry stops between the slices.
+    carry_select_adder_36bit u_csla (
+        .a(mult_to_adder),
+        .b(acc_fb),
+        .cin(1'b0),
+        .g_int8_or_int16(G2),
+        .g_int16(G3),
+        .sum(sum_next),
+        .cout()
+    );
+
+    // ---- Slice 1: bits [11:0] (INT4, INT8, INT16) ----
+    // Priority: reset > clear > accumulate > hold.
+    //   clr_acc && acc_en : start a new sum with this product (acc = product)
+    //   clr_acc && !acc_en: just clear to 0
+    //   acc_en  && G1     : normal accumulate
+    //   otherwise         : the register keeps its value
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)             acc_q[11:0] <= 12'd0;
+        else if (clr_acc)       acc_q[11:0] <= acc_en ? sum_next[11:0] : 12'd0;
+        else if (acc_en && G1)  acc_q[11:0] <= sum_next[11:0];
+    end
+
+    // ---- Slice 2: bits [19:12] (INT8, INT16 only) - Frozen in INT4 ----
+    // Same priority as slice 1, but it only loads when G2 is 1. In INT4 a
+    // clear still resets it to 0, and otherwise it just holds its value.
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)             acc_q[19:12] <= 8'd0;
+        else if (clr_acc)       acc_q[19:12] <= (acc_en && G2) ? sum_next[19:12] : 8'd0;
+        else if (acc_en && G2)  acc_q[19:12] <= sum_next[19:12];
+    end
+
+    // ---- Slice 3: bits [35:20] (INT16 only) - Frozen in INT4 and INT8 ----
+    // Same priority again, but gated by G3.
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)             acc_q[35:20] <= 16'd0;
+        else if (clr_acc)       acc_q[35:20] <= (acc_en && G3) ? sum_next[35:20] : 16'd0;
+        else if (acc_en && G3)  acc_q[35:20] <= sum_next[35:20];
+    end
+
+    // ---- acc_valid flag ----
+    // Goes to 1 after the first valid accumulate. A clear drops it unless a
+    // new valid product starts the next sum in the same cycle.
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)        acc_valid <= 1'b0;
+        else if (clr_acc)  acc_valid <= acc_en;
+        else if (acc_en)   acc_valid <= 1'b1;
+    end
+
+    // Expose the stored accumulator value to the outside.
+    assign acc_out = acc_q;
+endmodule
+
+// --- 12. Top-Level Processing Element with Gated Inputs ---
+// Wraps everything together: input registers, multiplier, optional pipeline
+// register and accumulator.
+//   PIPELINED = 0 (default): multiplier -> adder in ONE clock cycle (no
+//                            extra register, lowest latency, longest path).
+//   PIPELINED = 1          : the product is stored in a register first, so
+//                            the multiplier and the adder get one cycle each
+//                            (shorter critical path, one cycle more latency).
+module pe #(
+    parameter PIPELINED = 0         // 0 = direct path, 1 = extra pipeline stage
+)(
+    input  wire        clk,         // clock
+    input  wire        rst_n,       // active-low asynchronous reset
+    input  wire        in_valid,    // 1 = a_in / b_in hold valid data this cycle
+    input  wire        clr_acc,     // 1 = start a new accumulation with this input
+    input  wire [1:0]  mode,        // precision mode (00 INT4, 01 INT8, 10 INT16)
+    input  wire [15:0] a_in,        // operand A from the neighbour / array edge
+    input  wire [15:0] b_in,        // operand B from the neighbour / array edge
+    output wire [15:0] a_out,       // registered A, forwarded to the next PE
+    output wire [15:0] b_out,       // registered B, forwarded to the next PE
+    output wire [35:0] acc_out,     // accumulated result of this PE
+    output wire        acc_valid    // 1 when acc_out holds a valid result
+);
+    // Precision Mode Decoding (same scheme used in every module)
+    wire en_int4  = (mode == 2'b00);
+    wire en_int8  = (mode == 2'b01);
+    wire en_int16 = (mode == 2'b10);
+
+    wire G1 = en_int4 | en_int8 | en_int16;     // low  nibble  used
+    wire G2 = en_int8 | en_int16;               // mid  nibble  used
+    wire G3 = en_int16;                         // high byte    used
+
+    // Clock gating enables for Input Register slices:
+    // A slice only loads new data when the input is valid AND the current
+    // precision needs that slice.
+    // NOTE: these are written as register ENABLE conditions. The synthesis
+    // tool may turn them into real clock-gating cells if clock gating is
+    // enabled in the flow.
+    wire en_in_lo  = in_valid & G1; // Bits [3:0]
+    wire en_in_mid = in_valid & G2; // Bits [7:4]
+    wire en_in_hi  = in_valid & G3; // Bits [15:8]
+
+    reg [15:0] a_q, b_q;            // registered operands (feed the multiplier AND a_out/b_out)
+    reg        in_valid_q, clr_acc_q;   // control bits delayed by one cycle to match a_q/b_q
+    reg [1:0]  mode_q;                  // mode delayed by one cycle to match a_q/b_q
+
+    // Control status pipeline registers
+    // Delay the control signals by one clock so they stay aligned with the
+    // data that is captured in a_q / b_q on the same clock edge.
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            in_valid_q <= 1'b0;
+            clr_acc_q  <= 1'b0;
+            mode_q     <= 2'b00;
+        end else begin
+            in_valid_q <= in_valid;
+            clr_acc_q  <= clr_acc;
+            mode_q     <= mode;
+        end
+    end
+
+    // Input Register Slice 1: Bits [3:0] (INT4, INT8, INT16)
+    // Loads whenever the input is valid; holds its value otherwise.
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            a_q[3:0] <= 4'd0;
+            b_q[3:0] <= 4'd0;
+        end else if (en_in_lo) begin
+            a_q[3:0] <= a_in[3:0];
+            b_q[3:0] <= b_in[3:0];
+        end
+    end
+
+    // Input Register Slice 2: Bits [7:4] (INT8, INT16 only) - CLOCK GATED IN INT4
+    // Three cases:
+    //   en_in_mid : load new data (valid input and mode is INT8/INT16)
+    //   !G2       : mode is INT4 -> clear this slice to 0 so no stale data
+    //               reaches the multiplier or the neighbouring PE
+    //   otherwise : (INT8/INT16 but input not valid) hold the old value
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            a_q[7:4] <= 4'd0;
+            b_q[7:4] <= 4'd0;
+        end else if (en_in_mid) begin
+            a_q[7:4] <= a_in[7:4];
+            b_q[7:4] <= b_in[7:4];
+        end else if (!G2) begin
+            a_q[7:4] <= 4'd0;
+            b_q[7:4] <= 4'd0;
+        end
+    end
+
+    // Input Register Slice 3: Bits [15:8] (INT16 only) - CLOCK GATED IN INT4 & INT8
+    // Same three cases as slice 2, but for the INT16-only upper byte.
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            a_q[15:8] <= 8'd0;
+            b_q[15:8] <= 8'd0;
+        end else if (en_in_hi) begin
+            a_q[15:8] <= a_in[15:8];
+            b_q[15:8] <= b_in[15:8];
+        end else if (!G3) begin
+            a_q[15:8] <= 8'd0;
+            b_q[15:8] <= 8'd0;
+        end
+    end
+
+    // Systolic Forwarding: clean zero-switching outputs on unused lines!
+    // The registered operands go straight out to the neighbouring PEs
+    // unchanged (they do not pass through the multiplier). Unused slices are
+    // zero in low-precision modes, so those output lines do not toggle.
+    assign a_out = a_q;
+    assign b_out = b_q;
+
+    // Multiplier Core
+    // Uses the registered operands and the registered (delayed) mode.
+    wire [31:0] product_comb;
+    multiplier_16bit_comb u_mult_core (
+        .mode(mode_q), .a(a_q), .b(b_q), .product(product_comb)
+    );
+
+    // Pipelining registers
+    // These registers always exist in the RTL, but they are only USED when
+    // PIPELINED = 1 (see the selection muxes below). They capture the product
+    // and the delayed control signals together, so everything stays aligned.
+    reg  [31:0] product_pipe;           // registered multiplier result
+    reg         pipe_valid, pipe_clr_acc;   // delayed valid / clear flags
+    reg  [1:0]  pipe_mode;              // delayed mode
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            product_pipe <= 32'd0; pipe_valid <= 1'b0;
+            pipe_clr_acc <= 1'b0;  pipe_mode <= 2'b00;
+        end else begin
+            product_pipe <= product_comb;
+            pipe_valid   <= in_valid_q;
+            pipe_clr_acc <= clr_acc_q;
+            pipe_mode    <= mode_q;
+        end
+    end
+
+    // Select the pipelined or the direct path for the accumulator inputs.
+    // PIPELINED is a parameter (fixed at compile time), so only one of the two
+    // paths exists in the final hardware; the select costs no mux.
+    wire [31:0] mult_to_acc = PIPELINED ? product_pipe : product_comb;
+    wire        acc_en_w    = PIPELINED ? pipe_valid   : in_valid_q;
+    wire        acc_clr_w   = PIPELINED ? pipe_clr_acc : clr_acc_q;
+    wire [1:0]  acc_mode_w  = PIPELINED ? pipe_mode    : mode_q;
+
+    // Accumulator Core
+    // Adds the (aligned) product to the stored sum and drives acc_out/acc_valid.
+    accumulator_36bit u_accumulator (
+        .clk(clk), .rst_n(rst_n),
+        .clr_acc(acc_clr_w), .acc_en(acc_en_w), .mode(acc_mode_w),
+        .product(mult_to_acc), .acc_out(acc_out), .acc_valid(acc_valid)
+    );
+endmodule
