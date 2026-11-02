@@ -1,0 +1,76 @@
+*Testbench*
+
+
+module tb_csa36;
+
+    reg  [35:0] a, b;
+    reg         cin;
+    wire [35:0] sum;
+    wire        cout;
+
+    reg  [36:0] expected;
+    integer     errors;
+    integer     tests;
+    integer     i;
+
+    csa36 dut (
+        .a(a), .b(b), .cin(cin),
+        .sum(sum), .cout(cout)
+    );
+
+    task check;
+        input [35:0] ta;
+        input [35:0] tb;
+        input        tc;
+        begin
+            a   = ta;
+            b   = tb;
+            cin = tc;
+            #10;
+            expected = {1'b0, ta} + {1'b0, tb} + tc;
+            tests = tests + 1;
+            if ({cout, sum} !== expected) begin
+                errors = errors + 1;
+                $display("FAIL: a=%h b=%h cin=%b got=%h expected=%h",
+                          ta, tb, tc, {cout, sum}, expected);
+            end
+        end
+    endtask
+
+    initial begin
+        $dumpfile("sim/csa36.vcd");
+        $dumpvars(0, tb_csa36);
+
+        errors = 0;
+        tests  = 0;
+
+        // Directed corner cases
+        check(36'h000000000, 36'h000000000, 1'b0);
+        check(36'h000000000, 36'h000000000, 1'b1);
+        check(36'hFFFFFFFFF, 36'h000000000, 1'b0);
+        check(36'hFFFFFFFFF, 36'h000000000, 1'b1);
+        check(36'hFFFFFFFFF, 36'hFFFFFFFFF, 1'b0);
+        check(36'hFFFFFFFFF, 36'hFFFFFFFFF, 1'b1);
+        check(36'hFFFFFFFFF, 36'h000000001, 1'b0);
+        check(36'hAAAAAAAAA, 36'h555555555, 1'b0);
+        check(36'hAAAAAAAAA, 36'h555555555, 1'b1);
+        check(36'h00000000F, 36'h000000001, 1'b0);
+
+        // Carry ripples up to every bit position
+        for (i = 0; i < 36; i = i + 1)
+            check((36'h1 << i) - 36'h1, 36'h1, 1'b0);
+
+        // Random tests
+        for (i = 0; i < 10000; i = i + 1)
+            check({$random, $random}, {$random, $random}, $random);
+
+        $display("--------------------------------");
+        $display("Tests run : %0d", tests);
+        $display("Errors    : %0d", errors);
+        if (errors == 0) $display("RESULT: PASS");
+        else             $display("RESULT: FAIL");
+        $display("--------------------------------");
+        $finish;
+    end
+
+endmodule
