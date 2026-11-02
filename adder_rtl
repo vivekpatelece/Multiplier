@@ -1,0 +1,123 @@
+RTL Verilog
+
+//=============================================================================
+// carry_select_adder.v
+// Parameterised Carry-Select Adder (after O. J. Bedrij, IRE Trans. EC, 1962)
+//
+//   N   : total adder width           (default 36 -> INT16 MAC accumulator:
+//                                       32-bit product + log2(16)=4 growth bits)
+//   BLK : section (block) width       (default 4  -> 9 sections for N = 36)
+//
+// Structure
+//   * Section 0 : plain ripple-carry adder driven by the real cin.
+//   * Sections 1..NBLK-1 : duplicated.  One copy assumes carry-in = 0 ("n"),
+//     the other assumes carry-in = 1 ("y").  Both run in parallel while the
+//     carry from the previous section is still being resolved.
+//   * The true carry out of section i-1 selects (mux) the correct sum and the
+//     correct carry-out of section i.
+//   Critical path = one BLK-bit ripple + (NBLK-1) mux delays on the carry chain.
+//
+// Works for any N/BLK (the last section is shortened if BLK does not divide N).
+// Two's-complement signed operands work unchanged; result wraps modulo 2^N.
+//=============================================================================
+
+// ---------------------------------------------------------------------------
+// W-bit ripple-carry adder (building block of every section)
+// ---------------------------------------------------------------------------
+module rca #(
+    parameter W = 4
+)(
+    input  wire [W-1:0] a,
+    input  wire [W-1:0] b,
+    input  wire         cin,
+    output wire [W-1:0] sum,
+    output wire         cout
+);
+    wire [W:0] c;
+    assign c[0] = cin;
+
+    genvar i;
+    generate
+        for (i = 0; i < W; i = i + 1) begin : fa
+            wire p = a[i] ^ b[i];                 // propagate
+            assign sum[i]  = p ^ c[i];
+            assign c[i+1]  = (a[i] & b[i]) | (p & c[i]);   // generate | propagate&cin
+        end
+    endgenerate
+
+    assign cout = c[W];
+endmodule
+
+
+// ---------------------------------------------------------------------------
+// N-bit carry-select adder
+// ---------------------------------------------------------------------------
+module carry_select_adder #(
+    parameter N   = 36,
+    parameter BLK = 4
+)(
+    input  wire [N-1:0] a,
+    input  wire [N-1:0] b,
+    input  wire         cin,
+    output wire [N-1:0] sum,
+    output wire         cout
+);
+    localparam NBLK = (N + BLK - 1) / BLK;        // number of sections
+
+    wire [NBLK:0] c;                              // c[i] = carry INTO section i
+    assign c[0] = cin;
+
+    genvar i;
+    generate
+        for (i = 0; i < NBLK; i = i + 1) begin : sec
+            localparam LO = i * BLK;                              // lowest bit
+            localparam W  = (LO + BLK <= N) ? BLK : (N - LO);     // section width
+
+            if (i == 0) begin : first
+                // lowest section: no duplication needed, real cin is available
+                rca #(.W(W)) u_rca (
+                    .a   (a[LO +: W]),
+                    .b   (b[LO +: W]),
+                    .cin (cin),
+                    .sum (sum[LO +: W]),
+                    .cout(c[1])
+                );
+            end
+            else begin : dup
+                wire [W-1:0] s_n, s_y;            // provisional sums  (cin=0 / cin=1)
+                wire         c_n, c_y;            // provisional carry-outs
+
+                rca #(.W(W)) u_n (
+                    .a(a[LO +: W]), .b(b[LO +: W]), .cin(1'b0),
+                    .sum(s_n), .cout(c_n)
+                );
+                rca #(.W(W)) u_y (
+                    .a(a[LO +: W]), .b(b[LO +: W]), .cin(1'b1),
+                    .sum(s_y), .cout(c_y)
+                );
+
+                // carry-select multiplexers
+                assign sum[LO +: W] = c[i] ? s_y : s_n;
+                assign c[i+1]       = c[i] ? c_y : c_n;
+            end
+        end
+    endgenerate
+
+    assign cout = c[NBLK];
+endmodule
+
+
+// ---------------------------------------------------------------------------
+// Convenience wrapper: fixed 36-bit instance
+// ---------------------------------------------------------------------------
+module csa36 (
+    input  wire [35:0] a,
+    input  wire [35:0] b,
+    input  wire        cin,
+    output wire [35:0] sum,
+    output wire        cout
+);
+    carry_select_adder #(.N(36), .BLK(4)) u_csa (
+        .a(a), .b(b), .cin(cin), .sum(sum), .cout(cout)
+    );
+endmodule
