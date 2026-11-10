@@ -1,0 +1,76 @@
+`timescale 1ns / 1ps
+// ============================================================================
+// File   : systolic_array.v
+// Module : systolic_array_16x16
+// Description: N x N (16x16 = 256 PEs) output-stationary systolic array of `pe`.
+//              Forwarding:
+//                - a_in passes West-to-East through PE row
+//                - b_in passes North-to-South through PE column
+//                - in_valid and clr_acc flow diagonally across the wavefront
+// ============================================================================
+module systolic_array_16x16 #(
+    parameter N       = 16,
+    parameter USE_ICG = 1
+)(
+    input  wire                clk,
+    input  wire                rst_n,
+    input  wire [2:0]          mode_oh,
+    input  wire [2:0]          gate,
+    input  wire                in_valid,
+    input  wire                clr_acc,
+    input  wire [N*16-1:0]     a_in,
+    input  wire [N*16-1:0]     b_in,
+    output wire [N*N*36-1:0]   acc_out
+);
+    wire [15:0] a_w [0:N*(N+1)-1];     // A input of PE(i,j) at i*(N+1)+j
+    wire [15:0] b_w [0:(N+1)*N-1];     // B input of PE(i,j) at i*N+j
+    wire        v_o [0:N*N-1];         // valid_out of PE(i,j)
+    wire        c_o [0:N*N-1];         // clr_out of PE(i,j)
+
+    genvar i, j;
+    generate
+        // Top edge: feed B inputs into first row
+        for (j = 0; j < N; j = j + 1) begin : g_b_edge
+            assign b_w[j] = b_in[16*j +: 16];
+        end
+
+        // 2D Array mesh of 16x16 PEs
+        for (i = 0; i < N; i = i + 1) begin : g_row
+            // Left edge: feed A inputs into first column
+            assign a_w[i*(N+1)] = a_in[16*i +: 16];
+
+            for (j = 0; j < N; j = j + 1) begin : g_col
+                wire v_i, c_i;
+
+                // Wavefront routing for in_valid and clr_acc
+                if (i == 0 && j == 0) begin : g_org
+                    assign v_i = in_valid;
+                    assign c_i = clr_acc;
+                end else if (j == 0) begin : g_down
+                    assign v_i = v_o[(i-1)*N];
+                    assign c_i = c_o[(i-1)*N];
+                end else begin : g_right
+                    assign v_i = v_o[i*N + j - 1];
+                    assign c_i = c_o[i*N + j - 1];
+                end
+
+                // PE Instance (row i, col j)
+                pe #(.USE_ICG(USE_ICG)) u_pe (
+                    .clk       (clk),
+                    .rst_n     (rst_n),
+                    .mode_oh   (mode_oh),
+                    .gate      (gate),
+                    .in_valid  (v_i),
+                    .clr_acc   (c_i),
+                    .a_in      (a_w[i*(N+1) + j]),
+                    .b_in      (b_w[i*N + j]),
+                    .a_out     (a_w[i*(N+1) + j + 1]),
+                    .b_out     (b_w[(i+1)*N + j]),
+                    .valid_out (v_o[i*N + j]),
+                    .clr_out   (c_o[i*N + j]),
+                    .acc_out   (acc_out[36*(i*N + j) +: 36])
+                );
+            end
+        end
+    endgenerate
+endmodule
