@@ -1,0 +1,34 @@
+`timescale 1ns / 1ps
+module skew_buf #(
+    parameter N = 16,
+    parameter W = 16
+)(
+    input  wire             clk,
+    input  wire             rst_n,
+    input  wire             en,
+    input  wire [N*W-1:0]   data_in,
+    output wire [N*W-1:0]   data_out
+);
+    genvar i;
+    generate
+        for (i = 0; i < N; i = i + 1) begin : g_row
+            if (i == 0) begin : g_wire
+                assign data_out[W*0 +: W] = data_in[W*0 +: W];
+            end else begin : g_dly
+                reg [W-1:0] pipe [0:i-1];
+                integer k;
+                always @(posedge clk or negedge rst_n) begin
+                    if (!rst_n) begin
+                        for (k = 0; k < i; k = k + 1)
+                            pipe[k] <= {W{1'b0}};
+                    end else if (en) begin
+                        pipe[0] <= data_in[W*i +: W];
+                        for (k = 1; k < i; k = k + 1)
+                            pipe[k] <= pipe[k-1];
+                    end
+                end
+                assign data_out[W*i +: W] = pipe[i-1];
+            end
+        end
+    endgenerate
+endmodule
