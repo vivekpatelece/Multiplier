@@ -1,0 +1,93 @@
+`timescale 1ns / 1ps
+// ============================================================================
+// File   : tensor_unit.v
+// Module : tensor_unit_16x16
+// Description: Top-Level 16x16 Systolic Tensor Unit combining:
+//              - tu_ctrl: Central state machine & precision decoders
+//              - skew_buf: A and B triangular skewing delay lines
+//              - systolic_array_16x16: 256 PEs with 36-bit CLA accumulators
+// ============================================================================
+module tensor_unit_16x16 #(
+    parameter N       = 16,
+    parameter USE_ICG = 1
+)(
+    input  wire              clk,
+    input  wire              rst_n,
+    input  wire              start,
+    input  wire [1:0]        mode,
+    input  wire [N*16-1:0]   a_in,
+    input  wire [N*16-1:0]   b_in,
+    output wire              busy,
+    output wire              done,
+    output wire              err,
+    output wire [N*N*36-1:0] c_out
+);
+    wire [2:0] mode_oh;
+    wire [2:0] gate;
+    wire       in_valid;
+    wire       clr_acc;
+
+    // --- Central Controller ---
+    tu_ctrl #(.N(N)) u_ctrl (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .start   (start),
+        .mode    (mode),
+        .busy    (busy),
+        .done    (done),
+        .err     (err),
+        .mode_oh (mode_oh),
+        .gate    (gate),
+        .in_valid(in_valid),
+        .clr_acc (clr_acc)
+    );
+
+    // --- Input Operand Gating at Array Boundary ---
+    wire [N*16-1:0] a_masked, b_masked;
+    genvar k;
+    generate
+        for (k = 0; k < N; k = k + 1) begin : g_mask
+            assign a_masked[16*k +: 16] = {
+                (a_in[16*k+8 +: 8] & {8{gate[2]}}),
+                (a_in[16*k+4 +: 4] & {4{gate[1]}}),
+                (a_in[16*k   +: 4] & {4{gate[0]}})
+            };
+            assign b_masked[16*k +: 16] = {
+                (b_in[16*k+8 +: 8] & {8{gate[2]}}),
+                (b_in[16*k+4 +: 4] & {4{gate[1]}}),
+                (b_in[16*k   +: 4] & {4{gate[0]}})
+            };
+        end
+    endgenerate
+
+    // --- Triangular Skew Buffers ---
+    wire [N*16-1:0] a_skewed, b_skewed;
+    skew_buf #(.N(N), .W(16)) u_skew_a (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .en      (in_valid),
+        .data_in (a_masked),
+        .data_out(a_skewed)
+    );
+
+    skew_buf #(.N(N), .W(16)) u_skew_b (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .en      (in_valid),
+        .data_in (b_masked),
+        .data_out(b_skewed)
+    );
+
+    // --- 16x16 Systolic Array ---
+    systolic_array_16x16 #(.N(N), .USE_ICG(USE_ICG)) u_array (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .mode_oh (mode_oh),
+        .gate    (gate),
+        .in_valid(in_valid),
+        .clr_acc (clr_acc),
+        .a_in    (a_skewed),
+        .b_in    (b_skewed),
+        .acc_out (c_out)
+    );
+endmodule
